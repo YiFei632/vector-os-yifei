@@ -69,6 +69,11 @@ vector-cli --sim            # SO-101 arm in MuJoCo (natural language: "wave", "p
 vector-cli --sim-go2        # Go2 quadruped in MuJoCo
 ```
 
+For the phase-one Unitree G1 EDU flagship A integration (29 body DoF + two
+Dex3-1 hands), including the exact asset contract, MuJoCo/Isaac startup,
+capability limits and live-acceptance checklist, see
+[docs/G1_EDU_FLAGSHIP_A_INTEGRATION.md](docs/G1_EDU_FLAGSHIP_A_INTEGRATION.md).
+
 ---
 
 ## Vector CLI

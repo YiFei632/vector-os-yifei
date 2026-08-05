@@ -91,7 +91,7 @@ class TestPlaceSkillDiagnosticsIKAbove:
         arm.ik = Mock(return_value=None)  # always fails
 
         skill = PlaceSkill()
-        context = _make_context(arm=arm)
+        context = _make_context(arm=arm, gripper=_default_gripper())
         result = skill.execute({"location": "front"}, context)
 
         assert result.success is False
@@ -107,7 +107,7 @@ class TestPlaceSkillDiagnosticsIKAbove:
 
         skill = PlaceSkill()
         # Use explicit x, y, z so we can predict the values
-        context = _make_context(arm=arm)
+        context = _make_context(arm=arm, gripper=_default_gripper())
         result = skill.execute({"x": 0.3, "y": 0.0, "z": 0.04}, context)
 
         assert result.result_data["target_cm"] == [30.0, 0.0, 4.0]
@@ -125,7 +125,7 @@ class TestPlaceSkillDiagnosticsMoveApproach:
         arm.move_joints = Mock(return_value=False)  # always fails
 
         skill = PlaceSkill()
-        context = _make_context(arm=arm)
+        context = _make_context(arm=arm, gripper=_default_gripper())
         result = skill.execute({"location": "front"}, context)
 
         assert result.success is False
@@ -141,7 +141,7 @@ class TestPlaceSkillDiagnosticsIKPlace:
         arm.ik = Mock(side_effect=[[0.1, 0.2, 0.3, 0.4, 0.5], None])
 
         skill = PlaceSkill()
-        context = _make_context(arm=arm)
+        context = _make_context(arm=arm, gripper=_default_gripper())
         result = skill.execute({"location": "front"}, context)
 
         assert result.success is False
@@ -160,7 +160,7 @@ class TestPlaceSkillDiagnosticsDescend:
         arm.move_joints = Mock(side_effect=[True, False])
 
         skill = PlaceSkill()
-        context = _make_context(arm=arm)
+        context = _make_context(arm=arm, gripper=_default_gripper())
         result = skill.execute({"location": "front"}, context)
 
         assert result.success is False
@@ -356,13 +356,13 @@ class TestGripperCloseSkillFailureModes:
 
 class TestGripperOpenSkillDiagnosticsNoGripper:
     def test_gripper_open_no_gripper_returns_diagnosis(self):
-        """context.gripper is None -> diagnosis == 'no_arm'."""
+        """context.gripper is None -> diagnosis == 'no_gripper'."""
         skill = GripperOpenSkill()
         context = _make_context(arm=None, gripper=None)
         result = skill.execute({}, context)
 
         assert result.success is False
-        assert result.result_data.get("diagnosis") == "no_arm"
+        assert result.result_data.get("diagnosis") == "no_gripper"
 
 
 class TestGripperOpenSkillDiagnosticsSuccess:
@@ -636,8 +636,8 @@ class TestPickSkillDiagnosticsSuccess:
 
 
 class TestPickSkillWorldModelFix:
-    def test_pick_removes_only_picked_object(self):
-        """After successful pick, only the picked object is removed from world model."""
+    def test_direct_pick_defers_world_model_mutation_to_executor(self):
+        """Skill execution alone must not pre-empt hold/drop effect handling."""
         skill = PickSkill()
         arm = _default_pick_arm()
         gripper = _default_pick_gripper()
@@ -664,8 +664,8 @@ class TestPickSkillWorldModelFix:
         result = skill.execute({"object_label": "mug"}, ctx)
 
         assert result.success is True
-        # mug_0 should be gone, cup_0 should still be there
-        assert world.get_object("mug_0") is None
+        assert result.result_data["picked_object_id"] == "mug_0"
+        assert world.get_object("mug_0") is not None
         assert world.get_object("cup_0") is not None
 
 

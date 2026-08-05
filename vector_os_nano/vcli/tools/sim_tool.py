@@ -9,10 +9,11 @@ Allows V to spin up simulations mid-conversation without requiring
 Supported simulations:
   arm   — SO-101 6-DOF arm (MuJoCoArm)
   go2   — Unitree Go2 quadruped (MuJoCoGo2 / IsaacSimProxy / GazeboGo2Proxy)
+  g1    — Unitree G1 EDU 29-DOF + dual Dex3-1 hands
 
 Supported backends:
-  mujoco — MuJoCo (default, physics + textured rendering)
-  mujoco — MuJoCo 3.x (lightweight fallback)
+  isaac  — Isaac Sim / Isaac Lab in Docker
+  mujoco — MuJoCo 3.x (default, lightweight local simulation)
   gazebo — Gz Sim Harmonic (ROS2-native, open-source)
 """
 from __future__ import annotations
@@ -57,14 +58,14 @@ def locate_mjpython(executable: str | None = None) -> str | None:
 
 @tool(
     name="start_simulation",
-    description="Start a robot simulation (arm or go2 quadruped) with isaac, mujoco, or gazebo backend. No restart needed.",
+    description="Start an arm, Go2, or G1 simulation with isaac, mujoco, or gazebo backend. No restart needed.",
     read_only=False,
     permission="ask",
 )
 class SimStartTool:
     """Start a simulation and register its skills into the tool registry.
 
-    Backends: mujoco (default), gazebo (Gz Sim Harmonic), isaac (Docker, archived).
+    Backends: mujoco (default), gazebo (Gz Sim Harmonic), isaac (Docker).
     """
 
     input_schema: dict[str, Any] = {
@@ -72,8 +73,11 @@ class SimStartTool:
         "properties": {
             "sim_type": {
                 "type": "string",
-                "enum": ["arm", "go2"],
-                "description": "Which simulation to start: 'arm' (SO-101) or 'go2' (Unitree Go2)",
+                "enum": ["arm", "go2", "g1"],
+                "description": (
+                    "Which simulation to start: 'arm' (SO-101), 'go2' "
+                    "(Unitree Go2), or 'g1' (29-DoF G1 + dual Dex3-1)"
+                ),
             },
             "gui": {
                 "type": "boolean",
@@ -90,7 +94,7 @@ class SimStartTool:
                 "default": "mujoco",
                 "description": (
                     "Simulation backend: 'mujoco' (default, physics + textured rendering), "
-                    "'gazebo' (Gz Sim Harmonic), or 'isaac' (Docker, archived)"
+                    "'gazebo' (Gz Sim Harmonic), or 'isaac' (Isaac Lab in Docker)"
                 ),
             },
             "with_arm": {
@@ -105,6 +109,22 @@ class SimStartTool:
                     "'go2sim' or '启动仿真', ask before calling."
                 ),
             },
+            "profile_path": {
+                "type": "string",
+                "description": (
+                    "ONLY for sim_type='g1'. Optional G1 deployment YAML; "
+                    "defaults to config/robots/g1_edu_flagship_a.yaml."
+                ),
+            },
+            "controller_mode": {
+                "type": "string",
+                "enum": ["whole_body"],
+                "default": "whole_body",
+                "description": (
+                    "ONLY for sim_type='g1'. Phase one accepts the validated "
+                    "whole-body controller contract only."
+                ),
+            },
         },
         "required": ["sim_type"],
     }
@@ -114,19 +134,43 @@ class SimStartTool:
         gui: bool = params.get("gui", True)
         backend: str = params.get("backend", "mujoco")
         with_arm: bool = bool(params.get("with_arm", False))
+        profile_path = params.get("profile_path")
+        controller_mode = params.get("controller_mode", "whole_body")
         app = context.app_state
         if app is None:
             return ToolResult(content="No app state available", is_error=True)
 
+        if sim_type not in {"arm", "go2", "g1"}:
+            return ToolResult(content=f"Unknown sim type: {sim_type}", is_error=True)
+        if backend not in {"isaac", "mujoco", "gazebo"}:
+            return ToolResult(content=f"Unknown simulation backend: {backend}", is_error=True)
+        if sim_type == "g1" and controller_mode != "whole_body":
+            return ToolResult(
+                content=f"Unsupported G1 controller mode: {controller_mode}",
+                is_error=True,
+            )
+
         # Check if already running
         current_agent = app.get("agent")
         if current_agent is not None:
+            running_type = getattr(current_agent, "_sim_type", None)
+            if running_type == sim_type:
+                hardware = getattr(current_agent, "_robot_name", sim_type)
+                return ToolResult(content=f"{sim_type} sim already running: {hardware}")
             current_arm = getattr(current_agent, "_arm", None)
             current_base = getattr(current_agent, "_base", None)
             if sim_type == "arm" and current_arm is not None:
                 return ToolResult(content=f"Arm sim already running: {type(current_arm).__name__}")
             if sim_type == "go2" and current_base is not None:
                 return ToolResult(content=f"Go2 sim already running: {type(current_base).__name__}")
+            if running_type is not None:
+                return ToolResult(
+                    content=(
+                        f"A {running_type} simulation is already running. "
+                        "Stop it before starting a different robot."
+                    ),
+                    is_error=True,
+                )
 
         try:
             if backend == "isaac":
@@ -134,6 +178,12 @@ class SimStartTool:
                     agent = self._start_isaac_go2()
                 elif sim_type == "arm":
                     agent = self._start_isaac_arm()
+                elif sim_type == "g1":
+                    agent = self._start_g1(
+                        backend="isaac",
+                        gui=gui,
+                        profile_path=profile_path,
+                    )
                 else:
                     return ToolResult(content=f"Unknown sim type: {sim_type}", is_error=True)
             elif backend == "gazebo":
@@ -141,7 +191,10 @@ class SimStartTool:
                     agent = self._start_gazebo_go2()
                 else:
                     return ToolResult(
-                        content="Gazebo backend only supports go2",
+                        content=(
+                            "Gazebo backend currently supports Go2 only; "
+                            "G1 is implemented for Isaac first and MuJoCo joint-control second"
+                        ),
                         is_error=True,
                     )
             else:
@@ -163,6 +216,12 @@ class SimStartTool:
                     agent = self._start_arm(gui=gui)
                 elif sim_type == "go2":
                     agent = self._start_go2(gui=gui, with_arm=with_arm)
+                elif sim_type == "g1":
+                    agent = self._start_g1(
+                        backend="mujoco",
+                        gui=gui,
+                        profile_path=profile_path,
+                    )
                 else:
                     return ToolResult(content=f"Unknown sim type: {sim_type}", is_error=True)
         except Exception as exc:
@@ -194,11 +253,7 @@ class SimStartTool:
             from vector_os_nano.vcli.dynamic_prompt import DynamicSystemPrompt
             from vector_os_nano.vcli.robot_context import RobotContextProvider
             from vector_os_nano.vcli.worlds import resolve_world
-            provider = RobotContextProvider(
-                base=getattr(agent, "_base", None),
-                scene_graph=getattr(agent, "_spatial_memory", None),
-                arm=getattr(agent, "_arm", None),
-            )
+            provider = RobotContextProvider(agent=agent)
             app["robot_ctx_provider"] = provider
             static_blocks = build_system_prompt(
                 agent=agent, cwd=context.cwd, robot_context=provider,
@@ -239,7 +294,6 @@ class SimStartTool:
         import signal
         parts: list[str] = []
         base = getattr(agent, "_base", None)
-        arm = getattr(agent, "_arm", None)
 
         # Go2: kill launched subprocess group (nav stack + bridge + MuJoCo)
         if base is not None:
@@ -261,24 +315,47 @@ class SimStartTool:
                     log_fh.close()
                 except Exception:
                     pass
+        # Agent owns the canonical, identity-deduplicated lifecycle.  This is
+        # essential for composite robots such as G1 (base + two arms + two
+        # hands sharing one transport), and remains compatible with legacy
+        # one-arm/one-base agents.
+        stop = getattr(agent, "stop", None)
+        if callable(stop):
             try:
-                base.disconnect()
-                parts.append(f"{type(base).__name__} disconnected")
+                stop()
+                parts.append("hardware stopped")
             except Exception:
                 pass
+        disconnect = getattr(agent, "disconnect", None)
+        if callable(disconnect):
+            try:
+                disconnect()
+                parts.append("hardware disconnected")
+            except Exception:
+                pass
+        else:
+            # Compatibility fallback for old agent-like objects.
+            for device in (
+                getattr(agent, "_gripper", None),
+                getattr(agent, "_arm", None),
+                base,
+            ):
+                if device is None:
+                    continue
+                close = getattr(device, "disconnect", None)
+                if callable(close):
+                    try:
+                        close()
+                        parts.append(f"{type(device).__name__} disconnected")
+                    except Exception:
+                        pass
 
-        # Arm + gripper (SO-101 arm-only sim, OR PiperROS2Proxy in go2-with-arm)
-        gripper = getattr(agent, "_gripper", None)
-        if gripper is not None:
+        runtime = getattr(agent, "_sim_runtime", None)
+        close_runtime = getattr(runtime, "close", None)
+        if runtime is not None and callable(close_runtime):
             try:
-                gripper.disconnect()
-                parts.append(f"{type(gripper).__name__} disconnected")
-            except Exception:
-                pass
-        if arm is not None:
-            try:
-                arm.disconnect()
-                parts.append(f"{type(arm).__name__} disconnected")
+                close_runtime()
+                parts.append("simulation runtime closed")
             except Exception:
                 pass
 
@@ -748,6 +825,143 @@ class SimStartTool:
         arm = IsaacSimArmProxy()
         arm.connect()
         return Agent(arm=arm)
+
+    @staticmethod
+    def _start_g1(
+        *,
+        backend: str,
+        gui: bool,
+        profile_path: str | None = None,
+    ) -> Any:
+        """Build the canonical named G1 robot for Isaac or MuJoCo.
+
+        Both backends expose the exact same G1Robot/Agent registries.  Backend
+        differences are confined to G1Transport and declared capabilities.
+        """
+        import os
+        from pathlib import Path
+
+        import yaml
+
+        from vector_os_nano.core.agent import Agent
+        from vector_os_nano.core.config import load_config
+        from vector_os_nano.hardware.g1 import G1Profile, G1Robot
+        from vector_os_nano.hardware.g1.pinocchio_kinematics import (
+            PinocchioG1Kinematics,
+        )
+        from vector_os_nano.skills.g1 import get_g1_skills
+        from vector_os_nano.perception.g1_grasp_perception import G1GraspPerception
+
+        repo = Path(__file__).resolve().parents[3]
+        selected_profile = Path(
+            profile_path
+            or os.environ.get("VECTOR_G1_PROFILE", "")
+            or repo / "config" / "robots" / "g1_edu_flagship_a.yaml"
+        ).expanduser().resolve()
+        profile = G1Profile.from_yaml(selected_profile)
+
+        with selected_profile.open("r", encoding="utf-8") as stream:
+            deployment = yaml.safe_load(stream) or {}
+        if not isinstance(deployment, dict):
+            raise ValueError(f"G1 deployment config must be a mapping: {selected_profile}")
+
+        cfg_path = repo / "config" / "user.yaml"
+        config = load_config(str(cfg_path)) if cfg_path.exists() else {}
+
+        def _deep_merge(target: dict, source: dict) -> dict:
+            result = dict(target)
+            for key, value in source.items():
+                if isinstance(value, dict) and isinstance(result.get(key), dict):
+                    result[key] = _deep_merge(result[key], value)
+                else:
+                    result[key] = value
+            return result
+
+        # Only runtime/skill sections belong in Agent config; robot assets stay
+        # inside the validated G1Profile.
+        config = _deep_merge(
+            config,
+            {
+                key: deployment[key]
+                for key in ("skills", "simulation")
+                if key in deployment
+            },
+        )
+        mujoco_cfg = deployment.get("simulation", {}).get("mujoco", {})
+
+        if backend == "isaac":
+            from vector_os_nano.hardware.sim.g1_isaac_transport import (
+                G1IsaacTransport,
+            )
+            transport = G1IsaacTransport(profile)
+        elif backend == "mujoco":
+            from vector_os_nano.hardware.sim.g1_mujoco_transport import (
+                MuJoCoG1Transport,
+            )
+            fixed_base = bool(
+                mujoco_cfg.get("fixed_base_manipulation", False)
+            )
+            locomotion_enabled = (
+                str(mujoco_cfg.get("locomotion", "kinematic")).strip().lower()
+                != "unsupported_without_policy"
+            )
+            scene_xml_path = mujoco_cfg.get("scene_xml_path")
+            transport = MuJoCoG1Transport(
+                profile,
+                gui=gui,
+                fixed_base_manipulation=fixed_base,
+                locomotion_enabled=locomotion_enabled,
+                scene_xml_path=scene_xml_path,
+            )
+        else:
+            raise ValueError(f"unsupported G1 backend: {backend}")
+
+        # A real URDF solver is required for the existing Cartesian pick/place
+        # controllers.  Joint-only startup would make those skills appear
+        # available while failing at first use, so dependency errors are loud.
+        kinematics = PinocchioG1Kinematics(profile)
+        for side in ("left", "right"):
+            kinematics.fk(side, [0.0] * len(profile.arm_joints[side]))
+        robot = G1Robot(profile, transport, kinematics=kinematics)
+        agent = Agent(
+            arms=robot.arms,
+            grippers=robot.grippers,
+            hands=robot.hands,
+            bases={"g1": robot.base},
+            default_arm_name=profile.default_arm,
+            default_gripper_name=profile.default_hand,
+            default_hand_name=profile.default_hand,
+            default_base_name="g1",
+            skills=get_g1_skills(),
+            config=config,
+        )
+        agent._sim_type = "g1"
+        agent._robot_name = profile.profile_id
+        agent._g1_robot = robot
+        agent._g1_profile_path = str(selected_profile)
+        agent._sim_backend = backend
+        agent._perception = G1GraspPerception(robot.base)
+        _persist_path = os.path.expanduser("~/.vector_os_nano/scene_graph.yaml")
+        room_layout_raw = mujoco_cfg.get("room_layout") or (repo / "config" / "room_layout.yaml")
+        room_layout = Path(room_layout_raw).expanduser()
+        if not room_layout.is_absolute():
+            room_layout = (repo / room_layout).resolve()
+        else:
+            room_layout = room_layout.resolve()
+        from vector_os_nano.core.scene_graph import SceneGraph
+        room_graph = SceneGraph(persist_path=_persist_path)
+        loaded_rooms = room_graph.load_layout(str(room_layout))
+        agent._spatial_memory = room_graph
+        agent._scene_layout_path = str(room_layout)
+        agent._scene_layout_rooms = loaded_rooms
+        try:
+            agent.connect()
+        except Exception:
+            agent.disconnect()
+            if transport.connected:
+                transport.disconnect()
+            raise
+        return agent
 
     def check_permissions(
         self, params: dict[str, Any], context: ToolContext

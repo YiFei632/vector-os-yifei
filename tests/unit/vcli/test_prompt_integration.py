@@ -245,6 +245,20 @@ class TestBackwardCompat:
         assert "robot_context" in params, "robot_context parameter missing from build_system_prompt"
         assert params["robot_context"].default is None, "robot_context default must be None"
 
+    def test_g1_capability_block_is_injected_for_g1_like_hardware(self) -> None:
+        """G1-specific capability guidance should appear when the hardware looks like G1."""
+        class _MockAgent:
+            _arm = type("Arm", (), {"name": "g1_left_arm", "dof": 7})()
+            _gripper = type("Grip", (), {"name": "g1_left_dex3"})()
+            _base = type("Base", (), {"name": "g1_base"})()
+            _perception = None
+            _world_model = type("WM", (), {"get_objects": lambda self: []})()
+            _skill_registry = type("SR", (), {"list_skills": lambda self: []})()
+
+        result = _build(agent=_MockAgent())
+        combined = _combined(result)
+        assert "MolmoSpaces RBY1 bridge tool" in combined
+
 
 class TestRobotContextErrorHandling:
     """Errors in robot_context.get_context_block() must not crash prompt building."""

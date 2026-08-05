@@ -1,7 +1,7 @@
 # Isaac Sim Docker image for Vector OS Nano
 #
-# Base: NVIDIA Isaac Sim 5.1.0 (Ubuntu 22.04, Python 3.11)
-# Adds: ROS2 Humble + CycloneDDS + Vector bridge scripts
+# Base: NVIDIA Isaac Sim 5.1.0 (Ubuntu 24.04, Python 3.11)
+# Adds: ROS2 Jazzy, Isaac Lab 2.3.2, pinned Unitree G1 runtime, Vector bridges
 #
 # Build:
 #   docker build --network host -t vector-isaac-sim:latest docker/isaac-sim/
@@ -32,9 +32,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # This means container and host both run Jazzy — no DDS version mismatch!
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    build-essential \
+    cmake \
+    git \
+    git-lfs \
     gnupg2 \
+    libssl-dev \
     lsb-release \
     software-properties-common \
+    unzip \
     && curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
        -o /usr/share/keyrings/ros-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
@@ -57,18 +63,66 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ── CycloneDDS config ──────────────────────────────────────────────────────────
 COPY cyclonedds.xml /opt/cyclonedds.xml
+COPY unitree-cyclonedds.xml /opt/unitree-cyclonedds.xml
 
-# ── Isaac Lab (RL training for Go2 locomotion) ─────────────────────────────────
+# ── Isaac Lab (supported 5.1/2.3.x runtime pair) ───────────────────────────────
 ENV ISAACSIM_PATH=/isaac-sim
 ENV ISAACSIM_PYTHON_EXE=/isaac-sim/python.sh
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/* \
-    && cd /opt && git clone --depth 1 --branch v2.3.2 https://github.com/isaac-sim/IsaacLab.git \
-    && cd /opt/IsaacLab && ./isaaclab.sh --install 2>&1 | tail -5 \
+RUN cd /opt && git clone --depth 1 --branch v2.3.2 https://github.com/isaac-sim/IsaacLab.git \
+    && ln -s /isaac-sim /opt/IsaacLab/_isaac_sim \
+    && test -x /opt/IsaacLab/_isaac_sim/python.sh \
+    && cd /opt/IsaacLab && ./isaaclab.sh --install \
     && echo "Isaac Lab installed"
+
+# ── Unitree SDK2 + official Isaac Lab integration ─────────────────────────────
+# The simulator repository, SDK, teleimager submodule and CycloneDDS core are
+# pinned. Assets and the >1 GB locomotion policy are deliberately NOT baked into
+# the image; they must be mounted and pass g1_isaac_runtime.py preflight.
+ARG CYCLONEDDS_REF=0.10.5
+ARG UNITREE_SDK2_REF=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+ARG UNITREE_SIM_REF=e30c25b1dffdf92ada1d6c8c1fe9a47bdde0fecc
+
+RUN git clone --depth 1 --branch ${CYCLONEDDS_REF} \
+        https://github.com/eclipse-cyclonedds/cyclonedds.git /opt/cyclonedds \
+    && cmake -S /opt/cyclonedds -B /opt/cyclonedds/build \
+        -DCMAKE_INSTALL_PREFIX=/opt/cyclonedds/install \
+        -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF \
+    && cmake --build /opt/cyclonedds/build --target install -j2
+
+ENV CYCLONEDDS_HOME=/opt/cyclonedds/install
+
+RUN mkdir -p /opt/unitree_sdk2_python \
+    && cd /opt/unitree_sdk2_python \
+    && git init \
+    && git remote add origin https://github.com/unitreerobotics/unitree_sdk2_python.git \
+    && git fetch --depth 1 origin ${UNITREE_SDK2_REF} \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${UNITREE_SDK2_REF}" \
+    && /isaac-sim/python.sh -m pip install --no-cache-dir /opt/unitree_sdk2_python
+
+# unitree_sdk2_python passes an inline CycloneDDS configuration to Domain(),
+# which takes precedence over CYCLONEDDS_URI. Bind the pinned simulator's DDS
+# participant explicitly to loopback so rt/lowcmd cannot reach a real G1.
+RUN mkdir -p /opt/unitree_sim_isaaclab \
+    && cd /opt/unitree_sim_isaaclab \
+    && git init \
+    && git remote add origin https://github.com/unitreerobotics/unitree_sim_isaaclab.git \
+    && git fetch --depth 1 origin ${UNITREE_SIM_REF} \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${UNITREE_SIM_REF}" \
+    && git submodule update --init --depth 1 \
+    && sed -i 's/ChannelFactoryInitialize(1)/ChannelFactoryInitialize(1, "lo")/' \
+        dds/dds_master.py \
+    && grep -Fq 'ChannelFactoryInitialize(1, "lo")' dds/dds_master.py \
+    && git rev-parse HEAD > .vector-pinned-revision \
+    && /isaac-sim/python.sh -m pip install --no-cache-dir -r requirements.txt \
+    && /isaac-sim/python.sh -m pip install --no-cache-dir -e teleimager \
+    && sed -i 's/^type:.*/type: isaacsim/' teleimager/cam_config_server.yaml \
+    && sed -i 's/^image_shape:.*/image_shape: [480, 640]/' teleimager/cam_config_server.yaml
 
 # ── Python bridge dependencies ─────────────────────────────────────────────────
 COPY bridge/requirements.txt /tmp/bridge_requirements.txt
-RUN /isaac-sim/python.sh -m pip install --no-cache-dir -r /tmp/bridge_requirements.txt 2>/dev/null || true
+RUN /isaac-sim/python.sh -m pip install --no-cache-dir -r /tmp/bridge_requirements.txt
 
 # ── Bridge scripts ─────────────────────────────────────────────────────────────
 RUN mkdir -p /vector/bridge
@@ -86,7 +140,12 @@ ENV ACCEPT_EULA=Y \
     ROS_DOMAIN_ID=0 \
     RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
     CYCLONEDDS_URI=/opt/cyclonedds.xml \
-    BRIDGE_SCRIPT=/vector/bridge/isaac_sim_bridge.py
+    ISAAC_ROBOT_TYPE=go2 \
+    UNITREE_SIM_ROOT=/opt/unitree_sim_isaaclab \
+    UNITREE_DDS_DOMAIN_ID=1 \
+    UNITREE_DDS_INTERFACE=lo \
+    UNITREE_CYCLONEDDS_URI=file:///opt/unitree-cyclonedds.xml \
+    BRIDGE_SCRIPT=/vector/bridge/isaac_sim_physics.py
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 COPY docker-entrypoint.sh /vector/docker-entrypoint.sh

@@ -25,6 +25,16 @@ import numpy as np
 
 from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
+from vector_os_nano.skills.motion_profile import (
+    HeldObjectOwnershipError,
+    LIMB_PARAMETER,
+    MotionCapabilityError,
+    require_cartesian_control,
+    require_gripper_control,
+    require_limb_owns_held_object,
+    resolve_joint_pose,
+    select_limb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +90,13 @@ class PlaceSkill:
     # (still holding). Preferred over placed_count() >= 1, which is trivially true in a
     # region-less robot world (all resting objects count) and so verifies nothing.
     verify_hint: str = "not holding_object()"
-    failure_modes: list[str] = ["no_arm", "ik_unreachable", "move_failed"]
+    failure_modes: list[str] = [
+        "no_arm", "no_gripper", "ik_unreachable", "move_failed",
+        "gripper_failed", "invalid_profile", "capability_unavailable",
+        "wrong_limb",
+    ]
     parameters: dict = {
+        "arm": LIMB_PARAMETER,
         "location": {
             "type": "string",
             "required": False,
@@ -127,11 +142,43 @@ class PlaceSkill:
             SkillResult(success=True, result_data={"placed_at": [x, y, z]}) on success.
             SkillResult(success=False, error_message=...) on failure.
         """
-        if context.arm is None:
+        params = params or {}
+        try:
+            arm, gripper, arm_name = select_limb(context, params)
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "no_arm"},
+            )
+        if arm is None:
             return SkillResult(
                 success=False,
                 error_message="No arm connected",
                 result_data={"diagnosis": "no_arm"},
+            )
+        if gripper is None:
+            return SkillResult(
+                success=False,
+                error_message=f"No matching gripper/hand for arm {arm_name!r}",
+                result_data={"diagnosis": "no_gripper"},
+            )
+        try:
+            require_limb_owns_held_object(context, arm_name)
+        except HeldObjectOwnershipError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "wrong_limb"},
+            )
+        try:
+            require_cartesian_control(arm)
+            require_gripper_control(gripper)
+        except MotionCapabilityError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "capability_unavailable"},
             )
 
         cfg_place = context.config.get("skills", {}).get("place", {})
@@ -140,11 +187,20 @@ class PlaceSkill:
             .get("pick", {})
             .get("pre_grasp_height", _DEFAULT_PRE_GRASP_HEIGHT)
         )
-        home_joints: list[float] = (
-            context.config.get("skills", {}).get("home", {}).get(
-                "joint_values", _DEFAULT_HOME_JOINTS
+        try:
+            home_joints = resolve_joint_pose(
+                context,
+                "home",
+                _DEFAULT_HOME_JOINTS,
+                arm=arm,
+                arm_name=arm_name,
             )
-        )
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "invalid_profile"},
+            )
 
         # Resolve target coordinates from location name or explicit params
         if "x" in params and "y" in params:
@@ -163,10 +219,10 @@ class PlaceSkill:
         above_pos = place_pos.copy()
         above_pos[2] += pre_grasp_h
 
-        current_joints = context.arm.get_joint_positions()
+        current_joints = arm.get_joint_positions()
 
         # IK for above-place position
-        q_above_result = context.arm.ik(
+        q_above_result = arm.ik(
             (above_pos[0], above_pos[1], above_pos[2]),
             current_joints,
         )
@@ -189,7 +245,7 @@ class PlaceSkill:
 
         # Move above target
         logger.info("[PLACE] Moving above target ...")
-        if not context.arm.move_joints(q_above, duration=_APPROACH_DURATION):
+        if not arm.move_joints(q_above, duration=_APPROACH_DURATION):
             return SkillResult(
                 success=False,
                 error_message="Move to above-place failed",
@@ -197,7 +253,7 @@ class PlaceSkill:
             )
 
         # IK for place position (warm-started from above)
-        q_place_result = context.arm.ik(
+        q_place_result = arm.ik(
             (place_pos[0], place_pos[1], place_pos[2]),
             q_above,
         )
@@ -215,7 +271,7 @@ class PlaceSkill:
 
         # Descend to place position
         logger.info("[PLACE] Descending ...")
-        if not context.arm.move_joints(q_place, duration=_DESCEND_DURATION):
+        if not arm.move_joints(q_place, duration=_DESCEND_DURATION):
             return SkillResult(
                 success=False,
                 error_message="Place descent failed",
@@ -224,12 +280,16 @@ class PlaceSkill:
 
         # Open gripper to release object
         logger.info("[PLACE] Opening gripper ...")
-        if context.gripper is not None:
-            context.gripper.open()
+        if gripper.open() is False:
+            return SkillResult(
+                success=False,
+                error_message="Gripper failed to release object",
+                result_data={"diagnosis": "gripper_failed", "phase": "release"},
+            )
 
         # Lift back to above position
         logger.info("[PLACE] Lifting ...")
-        if not context.arm.move_joints(q_above, duration=_LIFT_DURATION):
+        if not arm.move_joints(q_above, duration=_LIFT_DURATION):
             return SkillResult(
                 success=False,
                 error_message="Place lift failed",
@@ -237,17 +297,27 @@ class PlaceSkill:
             )
 
         # Close gripper and return home
-        if context.gripper is not None:
-            context.gripper.close()
+        if gripper.close() is False:
+            return SkillResult(
+                success=False,
+                error_message="Gripper failed to close after place",
+                result_data={"diagnosis": "gripper_failed", "phase": "close"},
+            )
 
         logger.info("[PLACE] Returning home ...")
-        context.arm.move_joints(home_joints, duration=_HOME_DURATION)
+        if arm.move_joints(home_joints, duration=_HOME_DURATION) is False:
+            return SkillResult(
+                success=False,
+                error_message="Return home after place failed",
+                result_data={"diagnosis": "move_failed", "phase": "home"},
+            )
 
         logger.info("[PLACE] Place complete!")
         return SkillResult(
             success=True,
             result_data={
                 "placed_at": [round(tx, 4), round(ty, 4), round(tz, 4)],
+                "arm": arm_name,
                 "diagnosis": "ok",
             },
         )

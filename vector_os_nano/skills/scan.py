@@ -15,6 +15,13 @@ import logging
 
 from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
+from vector_os_nano.skills.motion_profile import (
+    LIMB_PARAMETER,
+    MotionCapabilityError,
+    require_joint_control,
+    resolve_joint_pose,
+    select_limb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +52,13 @@ class ScanSkill:
     typical_duration_sec: float = 15.0
     # No meaningful state predicate — the always-safe truthy literal.
     verify_hint: str = "True"
-    parameters: dict = {}
+    parameters: dict = {"arm": LIMB_PARAMETER}
     preconditions: list[str] = []
     postconditions: list[str] = []
     effects: dict = {"is_moving": False}
-    failure_modes: list[str] = ["no_arm", "move_failed"]
+    failure_modes: list[str] = [
+        "no_arm", "move_failed", "invalid_profile", "capability_unavailable",
+    ]
 
     def execute(self, params: dict, context: SkillContext) -> SkillResult:
         """Move to scan joint configuration.
@@ -65,22 +74,43 @@ class ScanSkill:
             SkillResult(success=True) when arm reaches scan pose.
             SkillResult(success=False) if the arm move fails.
         """
-        scan_joints: list[float] = (
-            context.config
-            .get("skills", {})
-            .get("scan", {})
-            .get("joint_values", _DEFAULT_SCAN_JOINTS)
-        )
-
-        if context.arm is None:
+        try:
+            arm, _, arm_name = select_limb(context, params)
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "no_arm"},
+            )
+        if arm is None:
             return SkillResult(
                 success=False,
                 error_message="No arm connected",
                 result_data={"diagnosis": "no_arm"},
             )
 
-        logger.info("[SCAN] Moving to scan pose: %s", scan_joints)
-        success = context.arm.move_joints(scan_joints, duration=_SCAN_DURATION)
+        try:
+            require_joint_control(arm, label="arm")
+        except MotionCapabilityError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "capability_unavailable"},
+            )
+
+        try:
+            scan_joints = resolve_joint_pose(
+                context, "scan", _DEFAULT_SCAN_JOINTS,
+                arm=arm, arm_name=arm_name,
+            )
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "invalid_profile"},
+            )
+        logger.info("[SCAN] Moving %s to scan pose: %s", arm_name or "arm", scan_joints)
+        success = arm.move_joints(scan_joints, duration=_SCAN_DURATION)
 
         if not success:
             logger.error("[SCAN] Arm move failed")
@@ -93,5 +123,9 @@ class ScanSkill:
         logger.info("[SCAN] Done")
         return SkillResult(
             success=True,
-            result_data={"joint_values": list(scan_joints), "diagnosis": "ok"},
+            result_data={
+                "joint_values": list(scan_joints),
+                "arm": arm_name,
+                "diagnosis": "ok",
+            },
         )

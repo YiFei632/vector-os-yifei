@@ -87,6 +87,7 @@ class RobotState:
     joint_positions: tuple[float, ...] = ()
     gripper_state: str = "open"  # open | closed | holding
     held_object: str | None = None
+    held_by: str | None = None  # named arm/hand for single-object ownership
     is_moving: bool = False
     ee_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_xy: tuple[float, float] = (0.0, 0.0)  # base position in world XY plane (meters)
@@ -97,6 +98,7 @@ class RobotState:
             "joint_positions": list(self.joint_positions),
             "gripper_state": self.gripper_state,
             "held_object": self.held_object,
+            "held_by": self.held_by,
             "is_moving": self.is_moving,
             "ee_position": list(self.ee_position),
             "position_xy": list(self.position_xy),
@@ -109,6 +111,7 @@ class RobotState:
             joint_positions=tuple(float(v) for v in d.get("joint_positions", [])),
             gripper_state=str(d.get("gripper_state", "open")),
             held_object=d.get("held_object"),
+            held_by=d.get("held_by"),
             is_moving=bool(d.get("is_moving", False)),
             ee_position=tuple(float(v) for v in d.get("ee_position", [0.0, 0.0, 0.0])),
             position_xy=tuple(float(v) for v in d.get("position_xy", [0.0, 0.0])),  # type: ignore[arg-type]
@@ -187,6 +190,7 @@ class WorldModel:
             "joint_positions",
             "gripper_state",
             "held_object",
+            "held_by",
             "is_moving",
             "ee_position",
             "position_xy",
@@ -197,6 +201,7 @@ class WorldModel:
             joint_positions=updates.get("joint_positions", current.joint_positions),
             gripper_state=updates.get("gripper_state", current.gripper_state),
             held_object=updates.get("held_object", current.held_object),
+            held_by=updates.get("held_by", current.held_by),
             is_moving=updates.get("is_moving", current.is_moving),
             ee_position=updates.get("ee_position", current.ee_position),
             position_xy=updates.get("position_xy", current.position_xy),
@@ -348,9 +353,10 @@ class WorldModel:
         """Update world model based on skill execution results.
 
         Only applies effects when result.success is True. Built-in effects:
-            pick  → mark object as grasped, update robot held_object
+            pick  → mark object as grasped, update held_object and held_by
             place → mark object as placed, clear robot held_object
-            home  → set gripper_state to open
+            home / handover / gripper_open → clear held object, set gripper open
+            gripper_close                  → set gripper closed
 
         Unknown skill names are silently ignored (custom skills can call
         update_robot_state / add_object directly).
@@ -359,6 +365,22 @@ class WorldModel:
             return
 
         _skill = skill_name.lower()
+
+        result_data = getattr(result, "result_data", {})
+        if not isinstance(result_data, dict):
+            result_data = {}
+        selected_limb: str | None = None
+        for candidate in (
+            params.get("arm"),
+            params.get("hand"),
+            params.get("side"),
+            result_data.get("arm"),
+            result_data.get("hand"),
+            result_data.get("side"),
+        ):
+            if isinstance(candidate, str) and candidate in {"left", "right"}:
+                selected_limb = candidate
+                break
 
         if _skill == "pick":
             mode = params.get("mode", "drop")
@@ -381,14 +403,33 @@ class WorldModel:
                         last_seen=time.time(),
                         properties=old.properties,
                     )
-                self.update_robot_state(held_object=picked_id, gripper_state="holding")
+                self.update_robot_state(
+                    held_object=picked_id,
+                    held_by=selected_limb,
+                    gripper_state="holding",
+                )
             else:
                 # mode="drop" (default): remove the specific object, gripper returns open
                 if picked_id:
                     self.remove_object(picked_id)
-                self.update_robot_state(held_object=None, gripper_state="open")
+                self.update_robot_state(
+                    held_object=None, held_by=None, gripper_state="open"
+                )
 
         elif _skill == "place":
+            if (
+                self._robot.held_object is not None
+                and self._robot.held_by is not None
+                and selected_limb is not None
+                and self._robot.held_by != selected_limb
+            ):
+                logger.error(
+                    "WorldModel: refusing place effect for %s; %s owns %s",
+                    selected_limb,
+                    self._robot.held_by,
+                    self._robot.held_object,
+                )
+                return
             obj_id = params.get("object_id") or self._robot.held_object
             if obj_id and obj_id in self._objects:
                 old = self._objects[obj_id]
@@ -403,10 +444,41 @@ class WorldModel:
                     last_seen=time.time(),
                     properties=old.properties,
                 )
-            self.update_robot_state(held_object=None, gripper_state="open")
+            self.update_robot_state(
+                held_object=None, held_by=None, gripper_state="open"
+            )
 
-        elif _skill == "home":
-            self.update_robot_state(gripper_state="open")
+        elif _skill in {"home", "handover", "gripper_open"}:
+            # Each successful physical sequence has opened/released the
+            # selected gripper.  Keeping held_object here would make the
+            # authoritative gripper_empty postcondition fail after success.
+            if (
+                self._robot.held_object is not None
+                and self._robot.held_by is not None
+                and selected_limb is not None
+                and self._robot.held_by != selected_limb
+            ):
+                logger.error(
+                    "WorldModel: refusing %s release effect for %s; %s owns %s",
+                    _skill,
+                    selected_limb,
+                    self._robot.held_by,
+                    self._robot.held_object,
+                )
+                return
+            self.update_robot_state(
+                held_object=None, held_by=None, gripper_state="open"
+            )
+
+        elif _skill == "gripper_close":
+            # Closing alone does not prove an object was acquired.
+            if not (
+                self._robot.held_object is not None
+                and self._robot.held_by is not None
+                and selected_limb is not None
+                and self._robot.held_by != selected_limb
+            ):
+                self.update_robot_state(gripper_state="closed")
 
         else:
             logger.debug("WorldModel: no built-in effects for skill %r", skill_name)

@@ -44,6 +44,13 @@ def test_sim_default_no_headless():
     assert args.headless is False
 
 
+def test_sim_g1_default_no_headless():
+    from vector_os_nano.vcli.cli import parse_args
+    args = parse_args(["--sim-g1"])
+    assert args.sim_g1 is True
+    assert args.headless is False
+
+
 def test_sim_headless():
     from vector_os_nano.vcli.cli import parse_args
     args = parse_args(["--sim", "--headless"])
@@ -56,7 +63,7 @@ def test_sim_headless():
 
 
 def _make_args(**kwargs) -> argparse.Namespace:
-    defaults = {"sim": False, "sim_go2": False, "headless": False}
+    defaults = {"sim": False, "sim_go2": False, "sim_g1": False, "headless": False}
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
@@ -69,6 +76,11 @@ def test_wants_window_sim_no_headless():
 def test_wants_window_sim_go2_no_headless():
     from vector_os_nano.vcli.cli import _wants_window
     assert _wants_window(_make_args(sim_go2=True)) is True
+
+
+def test_wants_window_sim_g1_no_headless():
+    from vector_os_nano.vcli.cli import _wants_window
+    assert _wants_window(_make_args(sim_g1=True)) is True
 
 
 def test_wants_window_headless_suppresses():
@@ -113,6 +125,19 @@ def test_reexec_guard_skips_when_headless():
 
     with patch("os.execve", _fake_execve):
         _maybe_reexec_under_mjpython(_make_args(sim=True, headless=True))
+
+
+def test_reexec_guard_skips_when_g1_headless():
+    from vector_os_nano.vcli.cli import _maybe_reexec_under_mjpython
+
+    execve_called = False
+
+    def _fake_execve(*args, **kwargs):
+        nonlocal execve_called
+        execve_called = True
+
+    with patch("os.execve", _fake_execve):
+        _maybe_reexec_under_mjpython(_make_args(sim_g1=True, headless=True))
 
     assert not execve_called
 

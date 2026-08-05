@@ -485,6 +485,20 @@ class VectorEngine:
         _skill_registry_ref = skill_registry
 
         def _build_context() -> Any:
+            # A real Agent owns the canonical hardware/service injection logic.
+            # Reuse it so direct skill execution and VGG can never observe two
+            # different views of a composite robot.  Looking on the type avoids
+            # treating a dynamically-created MagicMock attribute as a builder.
+            public_builder = getattr(type(_agent_ref), "build_context", None)
+            if callable(public_builder):
+                return _agent_ref.build_context()
+            legacy_builder = getattr(type(_agent_ref), "_build_context", None)
+            if callable(legacy_builder):
+                return _agent_ref._build_context()
+
+            # Compatibility fallback for the lightweight agent-like objects used
+            # by integrations and tests that predate Agent.build_context().
+            from collections.abc import Mapping
             from vector_os_nano.core.skill import SkillContext
             _base = getattr(_agent_ref, "_base", None)
             _arm = getattr(_agent_ref, "_arm", None)
@@ -495,7 +509,36 @@ class VectorEngine:
             _wm = getattr(_agent_ref, "_world_model", None)
             _config = getattr(_agent_ref, "_config", None) or {}
             _cal = getattr(_agent_ref, "_calibration", None)
-            services: dict = {}
+            _named_arms = getattr(_agent_ref, "_arms", None)
+            _named_grippers = getattr(_agent_ref, "_grippers", None)
+            _named_hands = getattr(_agent_ref, "_hands", None)
+            _named_bases = getattr(_agent_ref, "_bases", None)
+            _named_services = getattr(_agent_ref, "_services", None)
+
+            arms = dict(_named_arms) if isinstance(_named_arms, Mapping) else {}
+            grippers = (
+                dict(_named_grippers)
+                if isinstance(_named_grippers, Mapping)
+                else {}
+            )
+            hands = dict(_named_hands) if isinstance(_named_hands, Mapping) else {}
+            bases = dict(_named_bases) if isinstance(_named_bases, Mapping) else {}
+            if not arms and _arm is not None:
+                arms = {"default": _arm}
+            if not grippers and _gripper is not None:
+                grippers = {"default": _gripper}
+            if not bases and _base is not None:
+                bases = {"default": _base}
+
+            def _default_name(attribute: str, registry: dict) -> str | None:
+                value = getattr(_agent_ref, attribute, None)
+                return value if isinstance(value, str) and value in registry else None
+
+            services: dict = (
+                dict(_named_services)
+                if isinstance(_named_services, Mapping)
+                else {}
+            )
             if _sg is not None:
                 services["spatial_memory"] = _sg
             if _skill_registry_ref is not None:
@@ -507,13 +550,20 @@ class VectorEngine:
             # context.arm / context.gripper and previously got None because
             # this builder only wired base + services.
             return SkillContext(
-                arms={"default": _arm} if _arm is not None else {},
-                grippers={"default": _gripper} if _gripper is not None else {},
-                bases={"go2": _base} if _base is not None else {},
+                arms=arms,
+                grippers=grippers,
+                hands=hands,
+                bases=bases,
                 perception_sources=(
                     {"default": _perception} if _perception is not None else {}
                 ),
                 services=services,
+                default_arm_name=_default_name("_default_arm_name", arms),
+                default_gripper_name=_default_name(
+                    "_default_gripper_name", grippers
+                ),
+                default_hand_name=_default_name("_default_hand_name", hands),
+                default_base_name=_default_name("_default_base_name", bases),
                 world_model=_wm,
                 calibration=_cal,
                 config=_config,

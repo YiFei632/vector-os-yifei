@@ -11,6 +11,16 @@ import logging
 
 from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
+from vector_os_nano.skills.motion_profile import (
+    HeldObjectOwnershipError,
+    LIMB_PARAMETER,
+    MotionCapabilityError,
+    require_gripper_control,
+    require_joint_control,
+    require_limb_owns_held_object,
+    resolve_joint_pose,
+    select_limb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +47,7 @@ class HomeSkill:
     typical_duration_sec: float = 12.0
     # Success predicate this skill is verified against (single-source for the planner).
     verify_hint: str = "arm_at_home()"
-    parameters: dict = {}
+    parameters: dict = {"arm": LIMB_PARAMETER}
     preconditions: list[str] = []
     postconditions: list[str] = ["gripper_empty"]
     effects: dict = {
@@ -45,7 +55,10 @@ class HomeSkill:
         "held_object": None,
         "is_moving": False,
     }
-    failure_modes: list[str] = ["no_arm", "move_failed"]
+    failure_modes: list[str] = [
+        "no_arm", "move_failed", "gripper_failed", "invalid_profile",
+        "capability_unavailable", "wrong_limb",
+    ]
 
     def execute(self, params: dict, context: SkillContext) -> SkillResult:
         """Move to home joint configuration, then open gripper.
@@ -61,22 +74,55 @@ class HomeSkill:
             SkillResult(success=True) when arm reaches home and gripper opens.
             SkillResult(success=False) if the arm move fails.
         """
-        home_joints: list[float] = (
-            context.config
-            .get("skills", {})
-            .get("home", {})
-            .get("joint_values", _DEFAULT_HOME_JOINTS)
-        )
-
-        if context.arm is None:
+        try:
+            arm, gripper, arm_name = select_limb(context, params)
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "no_arm"},
+            )
+        if arm is None:
             return SkillResult(
                 success=False,
                 error_message="No arm connected",
                 result_data={"diagnosis": "no_arm"},
             )
 
-        logger.info("[HOME] Moving to home pose: %s", home_joints)
-        success = context.arm.move_joints(home_joints, duration=_HOME_DURATION)
+        try:
+            require_limb_owns_held_object(context, arm_name)
+        except HeldObjectOwnershipError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "wrong_limb"},
+            )
+
+        try:
+            require_joint_control(arm, label="arm")
+            if gripper is not None:
+                require_gripper_control(gripper)
+        except MotionCapabilityError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "capability_unavailable"},
+            )
+
+        try:
+            home_joints = resolve_joint_pose(
+                context, "home", _DEFAULT_HOME_JOINTS,
+                arm=arm, arm_name=arm_name,
+            )
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "invalid_profile"},
+            )
+
+        logger.info("[HOME] Moving %s to home pose: %s", arm_name or "arm", home_joints)
+        success = arm.move_joints(home_joints, duration=_HOME_DURATION)
 
         if not success:
             logger.error("[HOME] Arm move failed")
@@ -86,12 +132,21 @@ class HomeSkill:
                 result_data={"diagnosis": "move_failed"},
             )
 
-        if context.gripper is not None:
+        if gripper is not None:
             logger.info("[HOME] Opening gripper")
-            context.gripper.open()
+            if gripper.open() is False:
+                return SkillResult(
+                    success=False,
+                    error_message="Gripper failed to open at home",
+                    result_data={"diagnosis": "gripper_failed"},
+                )
 
         logger.info("[HOME] Done")
         return SkillResult(
             success=True,
-            result_data={"joint_values": list(home_joints), "diagnosis": "ok"},
+            result_data={
+                "joint_values": list(home_joints),
+                "arm": arm_name,
+                "diagnosis": "ok",
+            },
         )

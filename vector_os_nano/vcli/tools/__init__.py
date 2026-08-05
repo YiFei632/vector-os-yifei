@@ -44,6 +44,7 @@ def discover_all_tools() -> list:
     from vector_os_nano.vcli.tools.ros2_tools import Ros2TopicsTool, Ros2NodesTool, Ros2LogTool
     from vector_os_nano.vcli.tools.nav_tools import NavStateTool, TerrainStatusTool
     from vector_os_nano.vcli.tools.reload_tool import SkillReloadTool
+    from vector_os_nano.vcli.tools.molmospaces_rby1 import MolmoSpacesRBY1Tool
     from vector_os_nano.vcli.tools.viz_tool import FoxgloveTool
 
     return [
@@ -67,6 +68,7 @@ def discover_all_tools() -> list:
         NavStateTool(),
         TerrainStatusTool(),
         SkillReloadTool(),
+        MolmoSpacesRBY1Tool(),
         FoxgloveTool(),
     ]
 
@@ -81,7 +83,7 @@ _TOOL_CATEGORIES: dict[str, list[str]] = {
     "diag": ["ros2_topics", "ros2_nodes", "ros2_log", "nav_state", "terrain_status"],
     # Sim lifecycle: kept enabled even in the dev (no-robot) world so the user can
     # spin up a sim conversationally ("start the arm sim").
-    "sim": ["start_simulation", "stop_simulation"],
+    "sim": ["start_simulation", "stop_simulation", "molmospaces_rby1"],
     "system": ["robot_status", "skill_reload", "open_foxglove"],
 }
 

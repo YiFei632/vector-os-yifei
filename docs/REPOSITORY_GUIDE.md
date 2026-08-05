@@ -76,21 +76,21 @@ Vector OS Nano 是一个面向物理智能的 Agent 编排运行时。它试图�
 | 聊天模型 | Anthropic API；OpenAI-compatible API，包括 OpenRouter、Ollama、vLLM 等 |
 | 专用模型 | Grounding DINO 检测器；Moondream/Go2 VLM；EdgeTAM 分割跟踪 |
 | 真机 | SO-101 机械臂与夹爪；RealSense D405 |
-| 主仿真 | MuJoCo SO-101、MuJoCo Go2、Go2+Piper |
+| 主仿真 | MuJoCo SO-101、MuJoCo Go2、Go2+Piper；G1 rev-1.0 固定基座操作后端 |
 | 遗留仿真 | PyBullet 桌面机械臂 |
-| 实验后端 | Gazebo Harmonic、Isaac Sim，经 ROS2 proxy 接入 |
+| 实验后端 | Gazebo Harmonic；Isaac Sim（Go2 与 G1 29-DoF + 双 Dex3 插件），经 ROS2 proxy 接入 |
 | 外部系统 | FAR、TARE、Nav2、SLAM、SysNav，需要仓库外 ROS2 工作区 |
 
-“跨模型”当前最具体的落地是聊天 LLM 加上可被 producer 路由的 Grounding DINO 检测器；VLA、G1 和更完整的模型 zoo 仍主要是架构接口或路线图。
+“跨模型”当前最具体的落地是聊天 LLM 加上可被 producer 路由的 Grounding DINO 检测器。G1 已从纯路线图推进到 profile/HAL、双臂双手路由、固定 pelvis 运动学、MuJoCo 固定基座控制和 Isaac bridge 契约；VLA 和更完整的模型 zoo 仍主要是架构接口或路线图。
 
 ### 1.4 成熟度摘要
 
 | 状态 | 代表能力 |
 |---|---|
 | 已有较完整实现 | Agent Kernel、World/Skill/Tool 注册、VGG 验证、SO-101、MuJoCo 桌面臂、MuJoCo Go2、Go2+Piper、MCP 桌面臂 |
-| 部分落地 | Go2 导航、TARE/FAR 集成、感知抓取、SysNav 物体同步、ROS2 proxy |
-| 实验后端 | Gazebo、Isaac Sim、完整 ROS2 launch |
-| 路线图 | G1、通用 VLA、完整跨 embodiment 切换、稳定的 nav+grasp 产品链 |
+| 部分落地 | Go2 导航、TARE/FAR 集成、感知抓取、SysNav 物体同步、ROS2 proxy、G1 固定基座操作基线 |
+| 实验后端 | Gazebo、Isaac Sim、完整 ROS2 launch；G1 Isaac 尚待官方 USD/policy live 验收 |
+| 路线图 | G1 真机/传感器/动态行走与交互场景、通用 VLA、完整跨 embodiment 切换、稳定的 nav+grasp 产品链 |
 
 最新状态记录明确指出：nav+grasp 的机械链、感知精度和 docking 已推进到较深阶段，但抓取仍会因可达性/站位问题间歇失败，尚不能称为可靠落地。
 
@@ -1307,7 +1307,7 @@ MCP resources 可同时读取 WorldModel 和相机图像。
 | SO-101 | 是 | 是 | 有节点包装 | 否 | 否 | 是 |
 | Go2 | 协议层 | 是 | 是 | 实验 | 实验/archived | 本仓无真机 SDK |
 | Go2 + Piper | 是 | 是 | 是 | 未完整 | 未完整 | 本仓无完整真机链 |
-| G1 | 否 | 否 | 否 | 否 | 否 | 路线图 |
+| G1 29-DoF + 双 Dex3 | HAL/具名 Agent | 固定基座关节控制 | Isaac host ROS2 transport | 否 | 代码/契约测试，待官方资产 live 验收 | 本仓无真机 transport |
 
 ### 8.2 当前移动仿真的主链
 
@@ -1776,10 +1776,11 @@ ReAct 与 VGG ToolDispatcher 共用权限执行 seam。安全措施包括：
 - ROS2 Go2/Piper proxy；
 - SceneGraph 自动构建和房间语义；
 - Playground 场景产品化。
+- G1 固定 pelvis 位置 IK、MuJoCo 固定基座操作和 Isaac bridge；真实抓取、平衡行走与 live 容器验收仍依赖后续输入。
 
 ### 14.3 路线图或实验脚手架
 
-- G1；
+- G1 真机 transport、已标定传感器、动态行走/导航和门/冰箱等接触交互；
 - 通用 VLA；
 - 完整异构模型 zoo；
 - 统一 embodiment 热切换；

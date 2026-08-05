@@ -930,6 +930,14 @@ class PerceptionGraspSkill:
         )
         return gp, resolved, None
 
+    def _resolve_perception_backend(context):
+        perception = getattr(context, "perception", None)
+        if perception is None:
+            return None
+        if perception.__class__.__name__ in {"Go2GraspPerception", "G1GraspPerception"}:
+            return perception
+        return perception
+
     @staticmethod
     def _select_detection(detections: list, color: str | None):
         """Pick the box to grasp; PERCEPTUAL colour preference over max-confidence.

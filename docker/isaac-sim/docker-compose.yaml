@@ -53,11 +53,31 @@ services:
       - ISAAC_HEADLESS=${ISAAC_HEADLESS:-true}
       - DISPLAY=${DISPLAY:-:0}
 
+      # Robot runtime plugin. The default preserves the existing Go2 path.
+      # G1 aliases (g1/g129) are normalized to g1_29dof_dex3 by entrypoint.
+      - ISAAC_ROBOT_TYPE=${ISAAC_ROBOT_TYPE:-go2}
+
       # Scene: flat | room | apartment | navigation | hospital
       - ISAAC_SCENE=${ISAAC_SCENE:-flat}
 
       # Physics step rate (Hz). Bridge publishes at sub-multiples.
       - ISAAC_PHYSICS_HZ=${ISAAC_PHYSICS_HZ:-200}
+
+      # Unitree G1 29-DOF + dual Dex3 whole-body runtime. The pinned upstream
+      # simulator itself uses DDS domain 1; its traffic is restricted to lo by
+      # /opt/unitree-cyclonedds.xml so it cannot command a physical G1.
+      - UNITREE_SIM_ROOT=/opt/unitree_sim_isaaclab
+      - UNITREE_DDS_DOMAIN_ID=1
+      # Must remain loopback: the SDK's inline config overrides CYCLONEDDS_URI.
+      - UNITREE_DDS_INTERFACE=lo
+      - UNITREE_CYCLONEDDS_URI=file:///opt/unitree-cyclonedds.xml
+      - G1_DDS_STATE_TIMEOUT_SEC=${G1_DDS_STATE_TIMEOUT_SEC:-1.0}
+      - G1_TASK=${G1_TASK:-Isaac-Move-Cylinder-G129-Dex3-Wholebody}
+      - G1_POLICY_PATH=${G1_POLICY_PATH:-assets/model/policy.onnx}
+      - G1_ENABLE_CAMERAS=${G1_ENABLE_CAMERAS:-true}
+      - G1_NO_RENDER=${G1_NO_RENDER:-false}
+      - G1_LEGACY_ARM_SIDE=${G1_LEGACY_ARM_SIDE:-right}
+      - G1_STANDING_HEIGHT=${G1_STANDING_HEIGHT:-0.8}
 
       # Nucleus server (set to empty to use local bundled assets)
       - OMNI_SERVER=${OMNI_SERVER:-}
@@ -73,6 +93,11 @@ services:
       # USD scenes: mount project scenes so they can be edited on host
       - ./scenes:/vector/scenes:ro
 
+      # Complete official unitree_sim_isaaclab asset bundle.  Go2 ignores this
+      # mount. G1 startup fails before SimulationApp if the robot USD, scene
+      # assets, or assets/model/policy.onnx are absent.
+      - ${G1_ASSET_DIR:-./g1-assets}:/opt/unitree_sim_isaaclab/assets:ro
+
       # Persistent caches (Isaac Sim 5.1 uses uid 1234, not root)
       - isaac_main_cache:/isaac-sim/.cache:rw
       - isaac_compute_cache:/isaac-sim/.nv/ComputeCache:rw
@@ -86,19 +111,17 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
 
     # ── Health check ──────────────────────────────────────────────────────────
-    # Polls for /state_estimation topic. Declares healthy once the bridge is
-    # publishing. Timeout: 3 minutes (Isaac Sim shader compilation takes time).
+    # The ready flag is written only after the selected plugin validates its
+    # robot state. For G1 that means 29 body + 7 left Dex3 + 7 right Dex3 states
+    # plus root odometry, which navigation controllers require. The G1 bridge
+    # revokes this file if any of those four DDS streams is stale.
     healthcheck:
       test:
-        - CMD
-        - bash
-        - -c
-        - |
-          source /opt/ros/humble/setup.bash &&
-          timeout 5 ros2 topic hz /state_estimation --once 2>/dev/null | grep -q average
+        - CMD-SHELL
+        - test -s /tmp/isaac_state/ready && test -s /tmp/isaac_state/robot_type
       interval: 15s
       timeout: 10s
-      retries: 12
+      retries: 20
       start_period: 60s
 
     # ── Restart policy ────────────────────────────────────────────────────────

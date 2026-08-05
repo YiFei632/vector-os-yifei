@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Safety boundary for the Unitree simulation DDS topics.
+
+  unitree_sim_isaaclab publishes the same rt/lowcmd, rt/lowstate and Dex3
+  topics as a physical G1.  Restricting discovery and traffic to loopback
+  prevents a simulated command from reaching a real robot on the LAN.  ROS2
+  uses the separate /opt/cyclonedds.xml configuration.
+-->
+<CycloneDDS>
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo"/>
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <Peers>
+        <Peer address="localhost"/>
+      </Peers>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>50</MaxAutoParticipantIndex>
+    </Discovery>
+    <SharedMemory>
+      <Enable>false</Enable>
+    </SharedMemory>
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+      <OutputFile>stderr</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

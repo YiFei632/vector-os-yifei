@@ -19,16 +19,35 @@ logger = logging.getLogger(__name__)
 class RobotContextProvider:
     """Collects robot state and formats as Anthropic system block."""
 
-    def __init__(self, base: Any = None, scene_graph: Any = None, arm: Any = None) -> None:
-        self._base = base
-        self._sg = scene_graph
-        self._arm = arm
+    def __init__(
+        self,
+        base: Any = None,
+        scene_graph: Any = None,
+        arm: Any = None,
+        *,
+        agent: Any = None,
+        arms: dict[str, Any] | None = None,
+        hands: dict[str, Any] | None = None,
+    ) -> None:
+        self._base = base if base is not None else getattr(agent, "_base", None)
+        self._sg = (
+            scene_graph
+            if scene_graph is not None
+            else getattr(agent, "_spatial_memory", None)
+        )
+        self._arm = arm if arm is not None else getattr(agent, "_arm", None)
+        self._arms = dict(arms or getattr(agent, "_arms", {}) or {})
+        self._hands = dict(hands or getattr(agent, "_hands", {}) or {})
 
     def get_context_block(self) -> dict[str, str]:
         """Return Anthropic system block with current robot state."""
         lines: list[str] = []
         has_hardware = (
-            self._base is not None or self._sg is not None or self._arm is not None
+            self._base is not None
+            or self._sg is not None
+            or self._arm is not None
+            or bool(self._arms)
+            or bool(self._hands)
         )
 
         # Position + heading from base
@@ -75,7 +94,7 @@ class RobotContextProvider:
 
         # Nav/explore state — only meaningful for a mobile base (Go2), not an
         # arm-only sim, so don't inject quadruped fields into an arm prompt.
-        if self._base is not None:
+        if self._base is not None and _is_go2(self._base):
             try:
                 from vector_os_nano.skills.go2.explore import is_exploring, is_nav_stack_running
                 lines.append(f"Exploring: {'yes' if is_exploring() else 'no'}")
@@ -83,8 +102,24 @@ class RobotContextProvider:
             except ImportError:
                 pass
 
-        # Arm state (an arm-only sim has no base/scene_graph; still real hardware)
-        if self._arm is not None:
+        # Composite robots expose every named limb.  The legacy singular block
+        # remains byte-for-byte compatible for old arm-only construction.
+        if self._arms:
+            lines.append("Arms: " + ", ".join(
+                f"{side}={getattr(device, 'name', type(device).__name__)}"
+                f" ({getattr(device, 'dof', '?')}-DOF)"
+                for side, device in self._arms.items()
+            ))
+            for side, device in self._arms.items():
+                try:
+                    pos = device.get_joint_positions()
+                    lines.append(
+                        f"{side} arm joints: "
+                        + ", ".join(f"{float(value):.2f}" for value in pos)
+                    )
+                except Exception:
+                    pass
+        elif self._arm is not None:
             name = getattr(self._arm, "name", type(self._arm).__name__)
             dof = getattr(self._arm, "dof", None)
             lines.append(f"Arm: {name}" + (f" ({dof}-DOF)" if dof else "") + " connected")
@@ -94,10 +129,22 @@ class RobotContextProvider:
             except Exception:
                 pass
 
+        if self._hands:
+            lines.append("Hands: " + ", ".join(
+                f"{side}={getattr(device, 'name', type(device).__name__)}"
+                f" ({getattr(device, 'dof', '?')}-DOF)"
+                for side, device in self._hands.items()
+            ))
+
         if not has_hardware:
             return {"type": "text", "text": "[Robot State]\nNo hardware connected."}
 
         return {"type": "text", "text": "[Robot State]\n" + "\n".join(lines)}
+
+
+def _is_go2(base: Any) -> bool:
+    name = getattr(base, "name", "")
+    return isinstance(name, str) and "go2" in name.lower()
 
 
 def _heading_to_compass(degrees: float) -> str:

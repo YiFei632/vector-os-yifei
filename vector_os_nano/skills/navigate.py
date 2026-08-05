@@ -143,6 +143,73 @@ _COORD_VICINITY_RADIUS_M: float = 1.5
 # Helper functions
 # ---------------------------------------------------------------------------
 
+def _navigation_service(context: SkillContext) -> Any | None:
+    """Return the explicitly injected navigation service, if usable.
+
+    ``navigation`` is the canonical key.  ``nav`` remains supported for old
+    Agent configurations and existing NavStackClient users.
+    """
+    services = context.services or {}
+    nav = services.get("navigation") or services.get("nav")
+    if nav is None:
+        return None
+    available = getattr(nav, "is_available", True)
+    try:
+        available = available() if callable(available) else available
+    except Exception:
+        return None
+    return nav if bool(available) and callable(getattr(nav, "navigate_to", None)) else None
+
+
+def _is_go2_base(base: Any) -> bool:
+    """Whether Go2-specific navigation lifecycle hooks are appropriate."""
+    name = getattr(base, "name", "")
+    return isinstance(name, str) and "go2" in name.lower()
+
+
+def _prepare_navigation(base: Any) -> None:
+    """Apply legacy Go2 navigation hooks without leaking them to other robots."""
+    if not _is_go2_base(base):
+        return
+    try:
+        from vector_os_nano.skills.go2.explore import cancel_exploration, is_exploring
+        if is_exploring():
+            cancel_exploration()
+            logger.info("[NAV] Cancelled background Go2 exploration")
+    except Exception:
+        pass
+    try:
+        import os
+        if not os.path.exists("/tmp/vector_nav_active"):
+            with open("/tmp/vector_nav_active", "w") as stream:
+                stream.write("1")
+    except Exception:
+        pass
+
+
+def _finish_navigation(base: Any) -> None:
+    """Disarm the legacy Go2 path follower and command a stationary hold."""
+    if _is_go2_base(base):
+        try:
+            import os
+            if os.path.exists("/tmp/vector_nav_active"):
+                os.remove("/tmp/vector_nav_active")
+        except Exception:
+            pass
+    stop = getattr(base, "stop", None)
+    if callable(stop):
+        try:
+            stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[NAV] stop after navigation failed: %s", exc)
+        return
+    set_velocity = getattr(base, "set_velocity", None)
+    if callable(set_velocity):
+        try:
+            set_velocity(0.0, 0.0, 0.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[NAV] zero velocity after navigation failed: %s", exc)
+
 def _resolve_room(name: str, sg: Any = None) -> str | None:
     """Resolve a room name/alias to canonical room key.
 
@@ -290,7 +357,8 @@ def _navigate_to_waypoint(
 ) -> bool:
     """Turn toward waypoint and walk to it via dead-reckoning.
 
-    Returns True if arrived upright, False if robot fell.
+    Returns True only when both motion stages were accepted and odometry ends
+    inside the arrival radius while the robot remains upright.
     """
     pos = base.get_position()
     cx, cy = pos[0], pos[1]
@@ -310,17 +378,30 @@ def _navigate_to_waypoint(
         vyaw = _TURN_SPEED if turn_needed > 0 else -_TURN_SPEED
         turn_dur = abs(turn_needed) / _TURN_SPEED
         logger.info("[NAV] Turn %.0f deg toward %s", math.degrees(turn_needed), label)
-        base.walk(0.0, 0.0, vyaw, turn_dur)
+        if not base.walk(0.0, 0.0, vyaw, turn_dur):
+            logger.error("[NAV] Turn command failed on the way to %s", label)
+            return False
 
     # Walk forward to waypoint
     walk_dur = dist / _WALK_SPEED
     logger.info("[NAV] Walk %.1fm to %s", dist, label)
-    base.walk(_WALK_SPEED, 0.0, 0.0, walk_dur)
+    if not base.walk(_WALK_SPEED, 0.0, 0.0, walk_dur):
+        logger.error("[NAV] Forward command failed on the way to %s", label)
+        return False
 
     # Upright check (z < 0.12 means robot has fallen)
     pos = base.get_position()
     if pos[2] < 0.12:
         logger.error("[NAV] Robot fell during navigation to %s", label)
+        return False
+    remaining = _distance(pos[0], pos[1], target_x, target_y)
+    if remaining >= _ARRIVAL_RADIUS:
+        logger.error(
+            "[NAV] Odometry did not reach %s: %.2fm remains (limit %.2fm)",
+            label,
+            remaining,
+            _ARRIVAL_RADIUS,
+        )
         return False
     return True
 
@@ -431,35 +512,16 @@ class NavigateSkill:
         logger.info("[NAV] Using learned position for %s: (%.1f, %.1f)",
                     room_key, target[0], target[1])
 
-        # Cancel background exploration if running (navigate takes priority)
-        try:
-            from vector_os_nano.skills.go2.explore import cancel_exploration, is_exploring
-            if is_exploring():
-                cancel_exploration()
-                logger.info("[NAV] Cancelled background exploration for navigation")
-        except Exception:
-            pass
+        _prepare_navigation(context.base)
 
-        # Ensure nav flag exists so bridge path follower is armed
-        try:
-            import os
-            if not os.path.exists("/tmp/vector_nav_active"):
-                with open("/tmp/vector_nav_active", "w") as fh:
-                    fh.write("1")
-        except Exception:
-            pass
-
-        # --- Mode 0: Direct nav stack via proxy ---
-        if hasattr(context.base, "navigate_to"):
-            result = self._navigate_with_proxy(room_key, target, context)
-            return result
-
-        # --- Mode 1: NavStackClient ---
-        nav = context.services.get("nav")
-        if nav is not None and nav.is_available:
+        # Hardware-independent priority: an explicitly injected navigation
+        # service wins, then a base-native planner, then direct locomotion.
+        nav = _navigation_service(context)
+        if nav is not None:
             result = self._navigate_with_nav_stack(nav, room_key, target, context)
+        elif callable(getattr(context.base, "navigate_to", None)):
+            result = self._navigate_with_proxy(room_key, target, context)
         else:
-            # --- Mode 2: Dead-reckoning fallback ---
             result = self._dead_reckoning(room_key, context)
 
         return result
@@ -506,22 +568,13 @@ class NavigateSkill:
         """
         base = context.base
         tx, ty = coord
-        navigate_to = getattr(base, "navigate_to", None)
+        nav = _navigation_service(context)
+        navigate_to = getattr(nav, "navigate_to", None) if nav is not None else None
+        mode = "nav_service_coord" if nav is not None else "proxy_coord"
         if not callable(navigate_to):
-            return SkillResult(
-                success=False,
-                error_message="Coordinate navigation needs a nav stack (base.navigate_to absent).",
-                diagnosis_code="navigation_failed",
-            )
+            navigate_to = getattr(base, "navigate_to", None)
 
-        # Ensure the bridge path follower is armed (same as the room path).
-        try:
-            import os
-            if not os.path.exists("/tmp/vector_nav_active"):
-                with open("/tmp/vector_nav_active", "w") as fh:
-                    fh.write("1")
-        except Exception:
-            pass
+        _prepare_navigation(base)
 
         logger.info("[NAV] Coordinate goal -> navigate_to(%.2f, %.2f) via FAR", tx, ty)
 
@@ -529,11 +582,19 @@ class NavigateSkill:
             print(f"  >> 距目标 {dist:.1f}m, 已走 {int(elapsed)}s",
                   file=sys.stderr, flush=True)
 
-        try:
-            ok = bool(navigate_to(tx, ty, timeout=_COORD_NAV_TIMEOUT_S, on_progress=_progress))
-        except TypeError:
-            # A base whose navigate_to does not accept the extra kwargs.
-            ok = bool(navigate_to(tx, ty))
+        if callable(navigate_to):
+            try:
+                ok = bool(navigate_to(tx, ty, timeout=_COORD_NAV_TIMEOUT_S, on_progress=_progress))
+            except TypeError:
+                try:
+                    ok = bool(navigate_to(tx, ty, timeout=_COORD_NAV_TIMEOUT_S))
+                except TypeError:
+                    ok = bool(navigate_to(tx, ty))
+        else:
+            # Last-resort BaseProtocol path.  This has no obstacle avoidance,
+            # but preserves useful coordinate navigation for a basic backend.
+            ok = _navigate_to_waypoint(base, tx, ty, "coordinate goal")
+            mode = "direct_locomotion_coord"
 
         # HOLD at the goal. navigate_to leaves the dog under the planner/TARE,
         # which keeps publishing /way_point and DRIFTS the dog away from the goal
@@ -542,21 +603,7 @@ class NavigateSkill:
         # disarm the nav flag and stop the base now. (Symmetric with how a stop
         # command clears the flag; the proxy's loops treat the missing flag as
         # "no active nav".)
-        try:
-            import os
-            if os.path.exists("/tmp/vector_nav_active"):
-                os.remove("/tmp/vector_nav_active")
-        except Exception:
-            pass
-        stop = getattr(base, "stop", None) or getattr(base, "set_velocity", None)
-        if callable(stop):
-            try:
-                if stop is getattr(base, "set_velocity", None):
-                    stop(0.0, 0.0, 0.0)
-                else:
-                    stop()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("[NAV] coord-nav stop failed: %s", exc)
+        _finish_navigation(base)
 
         pos = base.get_position()
         dist = _distance(pos[0], pos[1], tx, ty)
@@ -580,7 +627,7 @@ class NavigateSkill:
                 "position": [round(pos[0], 1), round(pos[1], 1)],
                 "distance_to_target": round(dist, 1),
                 "far_confirmed": ok,
-                "mode": "proxy_coord",
+                "mode": mode,
             },
         )
 
@@ -608,9 +655,16 @@ class NavigateSkill:
                 flush=True,
             )
 
-        nav_result = context.base.navigate_to(
-            target[0], target[1], timeout=45.0, on_progress=_progress
-        )
+        navigate_to = context.base.navigate_to
+        try:
+            nav_result = navigate_to(
+                target[0], target[1], timeout=45.0, on_progress=_progress
+            )
+        except TypeError:
+            try:
+                nav_result = navigate_to(target[0], target[1], timeout=45.0)
+            except TypeError:
+                nav_result = navigate_to(target[0], target[1])
 
         pos = context.base.get_position()
         dist = _distance(pos[0], pos[1], target[0], target[1])
@@ -808,12 +862,21 @@ class NavigateSkill:
 
             # Use go_to_waypoint (simple /way_point) to avoid recursive
             # navigate_to → FAR probe → door-chain → navigate_to cascade.
-            _go_fn = getattr(base, "go_to_waypoint", None) or base.navigate_to
-            ok = _go_fn(
-                float(wx), float(wy),
-                timeout=per_wp,
-                on_progress=_progress,
-            )
+            _go_fn = getattr(base, "go_to_waypoint", None) or getattr(base, "navigate_to", None)
+            if callable(_go_fn):
+                try:
+                    ok = _go_fn(
+                        float(wx), float(wy),
+                        timeout=per_wp,
+                        on_progress=_progress,
+                    )
+                except TypeError:
+                    try:
+                        ok = _go_fn(float(wx), float(wy), timeout=per_wp)
+                    except TypeError:
+                        ok = _go_fn(float(wx), float(wy))
+            else:
+                ok = _navigate_to_waypoint(base, float(wx), float(wy), label)
             if not ok:
                 # navigate_to returned False — timed out or rejected by nav stack
                 return SkillResult(

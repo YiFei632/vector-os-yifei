@@ -9,7 +9,11 @@
 #   --scene <name>      Scene to load: flat (default), room, or apartment
 #
 # Environment overrides (set before calling this script):
+#   ISAAC_ROBOT_TYPE    go2 (default) or g1_29dof_dex3
+#   G1_ASSET_DIR        Complete official Unitree IsaacLab assets directory (G1)
+#   G1_POLICY_PATH      Policy path relative to UNITREE_SIM_ROOT (G1)
 #   ISAAC_PHYSICS_HZ    Physics step rate in Hz (default: 200)
+#   ISAAC_LAUNCH_TIMEOUT_SEC  Outer health wait override
 #   OMNI_SERVER         Nucleus server URL (e.g. omniverse://localhost)
 #   VECTOR_LOG_DIR      Host path for Isaac Sim logs (default: /tmp/vector_isaac_logs)
 
@@ -23,6 +27,7 @@ COMPOSE_FILE="${SCRIPT_DIR}/docker/isaac-sim/docker-compose.yaml"
 # ---------------------------------------------------------------------------
 ISAAC_HEADLESS="true"
 ISAAC_SCENE="flat"
+ISAAC_ROBOT_TYPE="${ISAAC_ROBOT_TYPE:-go2}"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -115,6 +120,42 @@ fi
 VECTOR_LOG_DIR="${VECTOR_LOG_DIR:-/tmp/vector_isaac_logs}"
 mkdir -p "${VECTOR_LOG_DIR}"
 
+# A G1 launch must use the complete, externally supplied official asset bundle.
+# Fail here instead of spending several minutes building/starting a container
+# whose runtime preflight is guaranteed to reject the placeholder directory.
+case "${ISAAC_ROBOT_TYPE}" in
+    g1|g129|g1_29dof_dex3|g1-29dof-dex3)
+        G1_ASSET_DIR_VALUE="${G1_ASSET_DIR:-}"
+        if [[ -z "${G1_ASSET_DIR_VALUE}" || ! -d "${G1_ASSET_DIR_VALUE}" ]]; then
+            echo "ERROR: G1 requires G1_ASSET_DIR to name the complete official unitree_sim_isaaclab/assets directory." >&2
+            exit 1
+        fi
+        G1_ASSET_DIR_VALUE="$(cd "${G1_ASSET_DIR_VALUE}" && pwd)"
+        G1_POLICY_PATH_VALUE="${G1_POLICY_PATH:-assets/model/policy.onnx}"
+        if [[ "${G1_POLICY_PATH_VALUE}" != assets/* || "${G1_POLICY_PATH_VALUE}" == *".."* ]]; then
+            echo "ERROR: G1_POLICY_PATH must be a safe path below assets/ (default: assets/model/policy.onnx)." >&2
+            exit 1
+        fi
+        G1_POLICY_ASSET_REL="${G1_POLICY_PATH_VALUE#assets/}"
+        G1_REQUIRED_ASSETS=(
+            "robots/g1-29dof_wholebody_dex3/g1_29dof_with_dex3_rev_1_0.usd"
+            "objects/small_warehouse/small_warehouse_digital_twin.usd"
+            "objects/PackingTable_2/PackingTable.usd"
+            "objects/PackingTable/PackingTable.usd"
+            "${G1_POLICY_ASSET_REL}"
+        )
+        for relative_path in "${G1_REQUIRED_ASSETS[@]}"; do
+            if [[ ! -s "${G1_ASSET_DIR_VALUE}/${relative_path}" ]]; then
+                echo "ERROR: G1 official runtime asset is missing or empty: ${G1_ASSET_DIR_VALUE}/${relative_path}" >&2
+                echo "       The supplied URDF/meshes/MJCF are sufficient for MuJoCo and Pinocchio, but the pinned Isaac whole-body task additionally requires its official USD bundle and policy." >&2
+                exit 1
+            fi
+        done
+        export G1_ASSET_DIR="${G1_ASSET_DIR_VALUE}"
+        export G1_POLICY_PATH="${G1_POLICY_PATH_VALUE}"
+        ;;
+esac
+
 # ---------------------------------------------------------------------------
 # Build image if not present or stale
 # ---------------------------------------------------------------------------
@@ -124,8 +165,8 @@ if ! docker image inspect "${IMAGE_TAG}" &>/dev/null; then
     echo "[launch_isaac] Image '${IMAGE_TAG}' not found. Building..."
     docker build \
         -t "${IMAGE_TAG}" \
-        "${SCRIPT_DIR}/docker/isaac-sim/" \
-        --progress=plain
+        --progress=plain \
+        "${SCRIPT_DIR}/docker/isaac-sim/"
 else
     echo "[launch_isaac] Using existing image '${IMAGE_TAG}'. (Re-build with: docker build -t ${IMAGE_TAG} docker/isaac-sim/)"
 fi
@@ -135,12 +176,14 @@ fi
 # ---------------------------------------------------------------------------
 export ISAAC_HEADLESS
 export ISAAC_SCENE
+export ISAAC_ROBOT_TYPE
 export VECTOR_LOG_DIR
 export DISPLAY="${DISPLAY:-:0}"
 
 echo ""
 echo "[launch_isaac] Starting Isaac Sim container..."
 echo "  Scene   : ${ISAAC_SCENE}"
+echo "  Robot   : ${ISAAC_ROBOT_TYPE}"
 echo "  Headless: ${ISAAC_HEADLESS}"
 echo "  Logs    : ${VECTOR_LOG_DIR}"
 echo ""
@@ -148,10 +191,19 @@ echo ""
 docker compose -f "${COMPOSE_FILE}" up -d
 
 # ---------------------------------------------------------------------------
-# Wait for health check (max 3 minutes — shader compilation is slow)
+# Wait for health check. G1's official IsaacLab task has a longer container-side
+# startup budget than the legacy Go2 plugin, so the outer wait must not expire
+# first. ISAAC_LAUNCH_TIMEOUT_SEC can override either default.
 # ---------------------------------------------------------------------------
 CONTAINER="vector-isaac-sim"
-MAX_WAIT=180
+case "${ISAAC_ROBOT_TYPE}" in
+    g1|g129|g1_29dof_dex3|g1-29dof-dex3)
+        MAX_WAIT="${ISAAC_LAUNCH_TIMEOUT_SEC:-360}"
+        ;;
+    *)
+        MAX_WAIT="${ISAAC_LAUNCH_TIMEOUT_SEC:-180}"
+        ;;
+esac
 INTERVAL=10
 elapsed=0
 
@@ -199,7 +251,11 @@ echo ""
 echo "  ROS2 topics (on host):"
 echo "    ros2 topic list"
 echo "    ros2 topic hz /state_estimation"
-echo "    ros2 topic hz /registered_scan"
+if [[ "${ISAAC_ROBOT_TYPE}" == g1* || "${ISAAC_ROBOT_TYPE}" == "g129" ]]; then
+    echo "    ros2 topic hz /joint_states"
+else
+    echo "    ros2 topic hz /registered_scan"
+fi
 echo ""
 echo "  Container logs:"
 echo "    docker logs -f ${CONTAINER}"

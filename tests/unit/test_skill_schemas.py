@@ -6,7 +6,7 @@
 Tests verify:
 - Each skill has correct name, description, parameters, pre/postconditions, effects
 - All skills satisfy the Skill runtime-checkable Protocol
-- get_default_skills() returns all 5 skills
+- get_default_skills() returns the complete built-in skill set
 """
 from __future__ import annotations
 
@@ -39,9 +39,8 @@ class TestHomeSkillSchema:
         assert isinstance(self.skill.description, str)
         assert len(self.skill.description) > 0
 
-    def test_parameters_empty(self):
-        """HomeSkill takes no parameters."""
-        assert self.skill.parameters == {}
+    def test_parameters_support_optional_named_arm(self):
+        assert self.skill.parameters["arm"]["required"] is False
 
     def test_preconditions_empty(self):
         """HomeSkill is always executable — no preconditions."""
@@ -79,8 +78,8 @@ class TestScanSkillSchema:
         assert isinstance(self.skill.description, str)
         assert len(self.skill.description) > 0
 
-    def test_parameters_empty(self):
-        assert self.skill.parameters == {}
+    def test_parameters_support_optional_named_arm(self):
+        assert self.skill.parameters["arm"]["required"] is False
 
     def test_preconditions_empty(self):
         assert self.skill.preconditions == []
@@ -229,7 +228,7 @@ class TestGetDefaultSkills:
         self.skills = get_default_skills()
 
     def test_returns_all_skills(self):
-        assert len(self.skills) == 9
+        assert len(self.skills) == 10
 
     def test_all_satisfy_skill_protocol(self):
         for skill in self.skills:
@@ -239,7 +238,10 @@ class TestGetDefaultSkills:
 
     def test_all_skill_names_present(self):
         names = {s.name for s in self.skills}
-        assert names == {"home", "scan", "describe", "detect", "pick", "place", "gripper_open", "gripper_close", "wave"}
+        assert names == {
+            "home", "scan", "describe", "detect", "pick", "place",
+            "gripper_open", "gripper_close", "wave", "handover",
+        }
 
     def test_all_skills_have_descriptions(self):
         for skill in self.skills:

@@ -22,6 +22,16 @@ import time
 
 from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
+from vector_os_nano.skills.motion_profile import (
+    HeldObjectOwnershipError,
+    LIMB_PARAMETER,
+    MotionCapabilityError,
+    require_gripper_control,
+    require_joint_control,
+    require_limb_owns_held_object,
+    resolve_joint_pose,
+    select_limb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +54,7 @@ class HandoverSkill:
     name: str = "handover"
     description: str = "Hand the held object to the user. Rotates arm toward user and releases. Use when user says 'give me' or '给我'."
     parameters: dict = {
+        "arm": LIMB_PARAMETER,
         "direction": {
             "type": "string",
             "required": False,
@@ -60,47 +71,106 @@ class HandoverSkill:
     preconditions: list[str] = ["gripper_holding_any"]
     postconditions: list[str] = ["gripper_empty"]
     effects: dict = {"gripper_state": "open", "held_object": None}
-    failure_modes: list[str] = ["no_arm", "move_failed"]
+    failure_modes: list[str] = [
+        "no_arm", "no_gripper", "move_failed", "gripper_failed",
+        "invalid_parameters", "invalid_profile", "capability_unavailable",
+        "wrong_limb",
+    ]
 
     def execute(self, params: dict, context: SkillContext) -> SkillResult:
-        if context.arm is None:
+        try:
+            arm, gripper, arm_name = select_limb(context, params)
+        except ValueError as exc:
+            return SkillResult(success=False, error_message=str(exc),
+                               result_data={"diagnosis": "no_arm"})
+        if arm is None:
             return SkillResult(success=False, error_message="No arm connected",
                                result_data={"diagnosis": "no_arm"})
+        if gripper is None:
+            return SkillResult(
+                success=False,
+                error_message=f"No matching gripper/hand for arm {arm_name!r}",
+                result_data={"diagnosis": "no_gripper"},
+            )
+        try:
+            require_limb_owns_held_object(context, arm_name)
+        except HeldObjectOwnershipError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "wrong_limb"},
+            )
+        try:
+            require_joint_control(arm, label="arm")
+            require_gripper_control(gripper)
+        except MotionCapabilityError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "capability_unavailable"},
+            )
 
-        home_joints: list[float] = (
-            context.config.get("skills", {})
-            .get("home", {})
-            .get("joint_values", _DEFAULT_HOME_JOINTS)
-        )
+        try:
+            home_joints = resolve_joint_pose(
+                context, "home", _DEFAULT_HOME_JOINTS,
+                arm=arm, arm_name=arm_name,
+            )
+        except ValueError as exc:
+            return SkillResult(success=False, error_message=str(exc),
+                               result_data={"diagnosis": "invalid_profile"})
 
         direction = params.get("direction", "right")
+        if direction not in {"left", "right"}:
+            return SkillResult(
+                success=False,
+                error_message=f"Unsupported handover direction: {direction!r}",
+                result_data={"diagnosis": "invalid_parameters"},
+            )
         # Rotate shoulder_pan: +90deg for right, -90deg for left
         rotation = 1.57 if direction == "right" else -1.57
 
         # Step 1: Move to handover position (rotate from home)
-        handover_joints = list(home_joints)
-        handover_joints[0] = handover_joints[0] + rotation
+        default_handover = list(home_joints)
+        default_handover[0] = default_handover[0] + rotation
+        try:
+            handover_joints = resolve_joint_pose(
+                context, "handover", default_handover,
+                arm=arm, arm_name=arm_name,
+                pose_key=f"joint_values_{direction}",
+            )
+        except ValueError as exc:
+            return SkillResult(success=False, error_message=str(exc),
+                               result_data={"diagnosis": "invalid_profile"})
 
         logger.info("[HANDOVER] Rotating %s (%.2f rad) to hand over...", direction, rotation)
-        if not context.arm.move_joints(handover_joints, duration=_HOME_DURATION):
+        if not arm.move_joints(handover_joints, duration=_HOME_DURATION):
             return SkillResult(success=False, error_message="Move to handover position failed",
                                result_data={"diagnosis": "move_failed", "phase": "rotate"})
 
         # Step 2: Open gripper to release
         logger.info("[HANDOVER] Opening gripper...")
-        if context.gripper is not None:
-            context.gripper.open()
-            time.sleep(0.5)
-            context.gripper.close()
+        if gripper.open() is False:
+            return SkillResult(
+                success=False,
+                error_message="Gripper failed to release during handover",
+                result_data={"diagnosis": "gripper_failed", "phase": "release"},
+            )
+        time.sleep(0.5)
+        if gripper.close() is False:
+            return SkillResult(
+                success=False,
+                error_message="Gripper failed to close after handover",
+                result_data={"diagnosis": "gripper_failed", "phase": "close"},
+            )
 
         # Step 3: Return home
         logger.info("[HANDOVER] Returning home...")
-        if not context.arm.move_joints(home_joints, duration=_HOME_DURATION):
+        if not arm.move_joints(home_joints, duration=_HOME_DURATION):
             return SkillResult(success=False, error_message="Return home failed",
                                result_data={"diagnosis": "move_failed", "phase": "home"})
 
         logger.info("[HANDOVER] Done!")
         return SkillResult(
             success=True,
-            result_data={"diagnosis": "ok", "direction": direction},
+            result_data={"diagnosis": "ok", "direction": direction, "arm": arm_name},
         )

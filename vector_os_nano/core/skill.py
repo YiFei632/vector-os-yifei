@@ -108,7 +108,9 @@ class SkillContext:
         ctx = SkillContext(
             arms={"so101": arm},
             grippers={"so101": gripper},
+            hands={"left": left_hand, "right": right_hand},
             bases={"go2": base},
+            default_hand_name="right",
             perception_sources={"realsense": cam},
             world_model=wm,
         )
@@ -124,9 +126,16 @@ class SkillContext:
         # New-style dict registries
         arms: dict | None = None,
         grippers: dict | None = None,
+        hands: dict | None = None,
         bases: dict | None = None,
         perception_sources: dict | None = None,
         services: dict | None = None,
+        # Explicit default names.  When omitted, the historical "first item"
+        # behaviour is preserved for backward compatibility.
+        default_arm_name: str | None = None,
+        default_gripper_name: str | None = None,
+        default_hand_name: str | None = None,
+        default_base_name: str | None = None,
         # Shared state
         world_model: Any = None,
         calibration: Any = None,
@@ -140,11 +149,25 @@ class SkillContext:
         # Dict registries (new-style API)
         self.arms: dict = arms if arms is not None else {}
         self.grippers: dict = grippers if grippers is not None else {}
+        self.hands: dict = hands if hands is not None else {}
         self.bases: dict = bases if bases is not None else {}
         self.perception_sources: dict = (
             perception_sources if perception_sources is not None else {}
         )
         self.services: dict = services if services is not None else {}
+
+        self.default_arm_name = self._validate_default_name(
+            "arm", default_arm_name, self.arms
+        )
+        self.default_gripper_name = self._validate_default_name(
+            "gripper", default_gripper_name, self.grippers
+        )
+        self.default_hand_name = self._validate_default_name(
+            "hand", default_hand_name, self.hands
+        )
+        self.default_base_name = self._validate_default_name(
+            "base", default_base_name, self.bases
+        )
 
         # Shared state
         self.world_model: Any = world_model
@@ -165,33 +188,62 @@ class SkillContext:
         self._has_legacy_perception: bool = perception is not _UNSET
         self._has_legacy_base: bool = base is not _UNSET
 
+    @staticmethod
+    def _validate_default_name(
+        kind: str,
+        name: str | None,
+        registry: dict,
+    ) -> str | None:
+        """Validate an optional explicit default against its registry."""
+        if name is not None and name not in registry:
+            available = ", ".join(str(key) for key in registry) or "none"
+            raise ValueError(
+                f"Unknown default {kind} {name!r}; available {kind}s: {available}"
+            )
+        return name
+
+    @staticmethod
+    def _registry_default(registry: dict, name: str | None) -> Any:
+        """Return an explicit default, or the historical first registry item."""
+        if not registry:
+            return None
+        if name is not None:
+            return registry[name]
+        return next(iter(registry.values()))
+
     # --- Backward-compatible property accessors ---
 
     @property
     def arm(self) -> Any:
-        """Return first arm from registry, falling back to legacy flat field."""
+        """Return selected arm from registry, falling back to legacy flat field."""
         if self.arms:
-            return next(iter(self.arms.values()))
+            return self._registry_default(self.arms, self.default_arm_name)
         return self._legacy_arm
 
     @property
     def gripper(self) -> Any:
-        """Return first gripper from registry, falling back to legacy flat field."""
+        """Return selected gripper, falling back to the legacy flat field."""
         if self.grippers:
-            return next(iter(self.grippers.values()))
+            return self._registry_default(self.grippers, self.default_gripper_name)
         return self._legacy_gripper
 
     @property
+    def hand(self) -> Any:
+        """Return the selected dexterous hand, if one is registered."""
+        return self._registry_default(self.hands, self.default_hand_name)
+
+    @property
     def base(self) -> Any:
-        """Return first base from registry, falling back to legacy flat field."""
+        """Return selected base from registry, falling back to legacy flat field."""
         if self.bases:
-            return next(iter(self.bases.values()))
+            return self._registry_default(self.bases, self.default_base_name)
         return self._legacy_base
 
     @base.setter
     def base(self, value: Any) -> None:
         """Set base — clears the bases dict and updates the legacy field."""
         self.bases.clear()
+        self.default_base_name = None
         self._legacy_base = value
         self._has_legacy_base = value is not None
 
@@ -214,6 +266,11 @@ class SkillContext:
             return name in self.grippers
         return bool(self.grippers) or self._legacy_gripper is not None
 
+    def has_hand(self, name: str | None = None) -> bool:
+        if name is not None:
+            return name in self.hands
+        return bool(self.hands)
+
     def has_base(self, name: str | None = None) -> bool:
         if name is not None:
             return name in self.bases
@@ -234,6 +291,11 @@ class SkillContext:
             return self.grippers.get(name)
         return self.gripper
 
+    def get_hand(self, name: str | None = None) -> Any:
+        if name is not None:
+            return self.hands.get(name)
+        return self.hand
+
     def get_base(self, name: str | None = None) -> Any:
         if name is not None:
             return self.bases.get(name)
@@ -243,10 +305,12 @@ class SkillContext:
         return {
             "has_arm": self.has_arm(),
             "has_gripper": self.has_gripper(),
+            "has_hand": self.has_hand(),
             "has_base": self.has_base(),
             "has_perception": self.has_perception(),
             "arm_names": list(self.arms.keys()),
             "gripper_names": list(self.grippers.keys()),
+            "hand_names": list(self.hands.keys()),
             "base_names": list(self.bases.keys()),
             "perception_names": list(self.perception_sources.keys()),
         }
@@ -257,6 +321,8 @@ class SkillContext:
             parts.append(f"arms={list(self.arms.keys())!r}")
         elif self._legacy_arm is not None:
             parts.append("arm=<legacy>")
+        if self.hands:
+            parts.append(f"hands={list(self.hands.keys())!r}")
         if self.bases:
             parts.append(f"bases={list(self.bases.keys())!r}")
         elif self._legacy_base is not None:

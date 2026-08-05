@@ -132,6 +132,7 @@ class TestRobotState:
         robot = wm.get_robot()
         assert robot.gripper_state == "open"
         assert robot.held_object is None
+        assert robot.held_by is None
         assert robot.is_moving is False
 
     def test_update_gripper_state(self, wm):
@@ -139,9 +140,12 @@ class TestRobotState:
         assert wm.get_robot().gripper_state == "closed"
 
     def test_update_held_object(self, wm):
-        wm.update_robot_state(held_object="obj_001", gripper_state="holding")
+        wm.update_robot_state(
+            held_object="obj_001", held_by="right", gripper_state="holding"
+        )
         robot = wm.get_robot()
         assert robot.held_object == "obj_001"
+        assert robot.held_by == "right"
         assert robot.gripper_state == "holding"
 
     def test_update_is_moving(self, wm):
@@ -155,11 +159,14 @@ class TestRobotState:
 
     def test_update_preserves_unset_fields(self, wm):
         """Updating one field should not reset others to defaults."""
-        wm.update_robot_state(gripper_state="closed", held_object="obj_001")
+        wm.update_robot_state(
+            gripper_state="closed", held_object="obj_001", held_by="right"
+        )
         wm.update_robot_state(is_moving=True)
         robot = wm.get_robot()
         assert robot.gripper_state == "closed"
         assert robot.held_object == "obj_001"
+        assert robot.held_by == "right"
         assert robot.is_moving is True
 
 
@@ -300,7 +307,9 @@ class TestSaveLoad:
         from vector_os_nano.core.world_model import WorldModel
         wm.add_object(cup_obj)
         wm.add_object(bottle_obj)
-        wm.update_robot_state(gripper_state="closed", held_object="obj_001")
+        wm.update_robot_state(
+            gripper_state="closed", held_object="obj_001", held_by="right"
+        )
 
         with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
             path = f.name
@@ -314,6 +323,7 @@ class TestSaveLoad:
             assert loaded.get_object("obj_001").label == "cup"
             assert loaded.get_robot().gripper_state == "closed"
             assert loaded.get_robot().held_object == "obj_001"
+            assert loaded.get_robot().held_by == "right"
         finally:
             Path(path).unlink(missing_ok=True)
 
@@ -344,6 +354,39 @@ class TestSkillEffects:
         assert robot.gripper_state == "open"
         assert len(wm.get_objects()) == 0
 
+    def test_pick_hold_records_named_owner(self, wm, cup_obj):
+        from vector_os_nano.core.types import SkillResult
+
+        wm.add_object(cup_obj)
+        wm.apply_skill_effects(
+            "pick",
+            {"object_id": "obj_001", "mode": "hold", "arm": "right"},
+            SkillResult(success=True),
+        )
+
+        assert wm.get_robot().held_object == "obj_001"
+        assert wm.get_robot().held_by == "right"
+
+    def test_non_owner_release_effect_cannot_clear_held_object(self, wm, cup_obj):
+        from vector_os_nano.core.types import SkillResult
+
+        wm.add_object(cup_obj)
+        wm.update_robot_state(
+            held_object="obj_001", held_by="right", gripper_state="holding"
+        )
+
+        wm.apply_skill_effects(
+            "gripper_open", {"hand": "left"}, SkillResult(success=True)
+        )
+        assert wm.get_robot().held_object == "obj_001"
+        assert wm.get_robot().held_by == "right"
+
+        wm.apply_skill_effects(
+            "gripper_open", {"hand": "right"}, SkillResult(success=True)
+        )
+        assert wm.get_robot().held_object is None
+        assert wm.get_robot().held_by is None
+
     def test_apply_place_effects(self, wm, cup_obj):
         from vector_os_nano.core.types import SkillResult
         wm.add_object(cup_obj)
@@ -357,10 +400,28 @@ class TestSkillEffects:
 
     def test_apply_home_effects(self, wm):
         from vector_os_nano.core.types import SkillResult
-        wm.update_robot_state(gripper_state="closed")
+        wm.update_robot_state(gripper_state="holding", held_object="obj_001")
         result = SkillResult(success=True)
         wm.apply_skill_effects("home", {}, result)
         assert wm.get_robot().gripper_state == "open"
+        assert wm.get_robot().held_object is None
+
+    @pytest.mark.parametrize("skill_name", ["handover", "gripper_open"])
+    def test_release_skill_effects_clear_held_object(self, wm, skill_name):
+        from vector_os_nano.core.types import SkillResult
+
+        wm.update_robot_state(gripper_state="holding", held_object="obj_001")
+        wm.apply_skill_effects(skill_name, {}, SkillResult(success=True))
+
+        assert wm.check_predicate("gripper_empty")
+
+    def test_gripper_close_effect_does_not_invent_held_object(self, wm):
+        from vector_os_nano.core.types import SkillResult
+
+        wm.apply_skill_effects("gripper_close", {}, SkillResult(success=True))
+
+        assert wm.get_robot().gripper_state == "closed"
+        assert wm.get_robot().held_object is None
 
     def test_apply_failed_skill_no_effect(self, wm, cup_obj):
         from vector_os_nano.core.types import SkillResult

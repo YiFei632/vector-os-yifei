@@ -53,7 +53,13 @@ from vector_os_nano.vcli.session import (
 from vector_os_nano.vcli.permissions import PermissionContext
 from vector_os_nano.vcli.prompt import build_system_prompt
 from vector_os_nano.vcli.turn_status import TurnStatus
-from vector_os_nano.vcli.tools import CategorizedToolRegistry, ToolRegistry, discover_all_tools, discover_categorized_tools
+from vector_os_nano.vcli.tools import (
+    CategorizedToolRegistry,
+    ToolContext,
+    ToolRegistry,
+    discover_all_tools,
+    discover_categorized_tools,
+)
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -88,6 +94,7 @@ SLASH_COMMANDS: list[tuple[str, str, bool]] = [
     ("model", "Show or switch model  (/model <name>)", True),
     ("config", "Show saved configuration", False),
     ("tools", "List all registered tools", False),
+    ("rby1", "Send a command to MolmoSpaces RBY1", True),
     ("agent", "Show V's identity and capabilities", False),
     ("status", "Show hardware, tools, session info", False),
     ("usage", "Show token usage this session", False),
@@ -275,6 +282,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--sim", action="store_true", help="Start with MuJoCo arm simulation")
     parser.add_argument("--sim-go2", action="store_true", help="Start with Go2 quadruped simulation")
+    parser.add_argument("--sim-g1", action="store_true", help="Start with G1 humanoid simulation")
     parser.add_argument(
         "--scenario",
         default=None,
@@ -288,7 +296,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Suppress the MuJoCo viewer window (default: window opens when --sim is active)",
+        help="Suppress the MuJoCo viewer window (default: window opens when --sim/--sim-g1 is active)",
+    )
+    parser.add_argument(
+        "--molmospaces-rby1-host",
+        default="127.0.0.1",
+        help="Default MolmoSpaces RBY1 bridge host",
+    )
+    parser.add_argument(
+        "--molmospaces-rby1-port",
+        type=int,
+        default=8765,
+        help="Default MolmoSpaces RBY1 bridge port",
+    )
+    parser.add_argument(
+        "--molmospaces-rby1-scene",
+        default=None,
+        help="Default scene name used by /rby1 reset",
+    )
+    parser.add_argument(
+        "--molmospaces-rby1-timeout",
+        type=float,
+        default=300.0,
+        help="Socket timeout in seconds for MolmoSpaces RBY1 bridge requests",
+    )
+    parser.add_argument(
+        "--molmospaces-rby1-viewer",
+        action="store_true",
+        help="Open a MuJoCo passive viewer in the MolmoSpaces RBY1 bridge process",
+    )
+    parser.add_argument(
+        "--molmospaces-rby1-viewer-camera",
+        default="free",
+        help="MuJoCo camera used by the MolmoSpaces RBY1 passive viewer",
+    )
+    parser.add_argument(
+        "--molmospaces-rby1-direct-text",
+        action="store_true",
+        help="Route non-slash text input directly to the MolmoSpaces RBY1 bridge",
     )
     parser.add_argument("--model", default=None, help="Model to use (overrides config; default reads ~/.vector/config.yaml)")
     parser.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume session")
@@ -634,6 +679,111 @@ def ask_permission(tool_name: str, params: dict[str, Any]) -> str:
     return Prompt.ask("  Allow? [y/n/a=always]", choices=["y", "n", "a"], default="y")
 
 
+def _build_cli_tool_context(
+    *,
+    agent: Any,
+    session: Session | None,
+    app_state: dict[str, Any] | None,
+    engine: Any,
+) -> ToolContext:
+    import threading
+
+    return ToolContext(
+        agent=agent,
+        cwd=Path.cwd(),
+        session=session,
+        permissions=getattr(engine, "_permissions", None) if engine is not None else None,
+        abort=threading.Event(),
+        app_state=app_state,
+    )
+
+
+def _rby1_base_params(args_rest: list[str], app_state: dict[str, Any] | None) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if not app_state:
+        return params
+    endpoint = app_state.get("molmospaces_rby1_endpoint")
+    if isinstance(endpoint, dict):
+        if endpoint.get("host"):
+            params["host"] = endpoint["host"]
+        if endpoint.get("port"):
+            params["port"] = endpoint["port"]
+        if endpoint.get("timeout_s"):
+            params["timeout_s"] = endpoint["timeout_s"]
+    scene_name = app_state.get("molmospaces_rby1_scene")
+    if scene_name:
+        params["scene_name"] = scene_name
+    if app_state.get("molmospaces_rby1_viewer"):
+        viewer_context = params.setdefault("context", {})
+        viewer_context["viewer"] = True
+        viewer_camera = app_state.get("molmospaces_rby1_viewer_camera")
+        if viewer_camera:
+            viewer_context["viewer_camera"] = viewer_camera
+    return params
+
+
+def _handle_rby1_slash_command(
+    args_rest: list[str],
+    registry: ToolRegistry,
+    session: Session | None,
+    app_state: dict[str, Any] | None,
+) -> bool:
+    tool = registry.get("molmospaces_rby1")
+    if tool is None:
+        console.print("[red]  molmospaces_rby1 tool is not registered.[/]")
+        return True
+
+    context = _build_cli_tool_context(
+        agent=(app_state or {}).get("agent"),
+        session=session,
+        app_state=app_state,
+        engine=(app_state or {}).get("engine"),
+    )
+    params = _rby1_base_params(args_rest, app_state)
+
+    if not args_rest:
+        console.print("[yellow]  Usage: /rby1 connect | observe | reset | stop | <instruction>[/]")
+        return True
+
+    head, tail = args_rest[0], args_rest[1:]
+    action = head.lower()
+    if action in {"connect", "observe", "reset", "stop", "execute"}:
+        params["action"] = action
+        if action == "reset" and tail:
+            params["scene_name"] = tail[0]
+        if action == "execute":
+            params["action"] = "execute"
+            params["instruction"] = " ".join(tail).strip()
+    else:
+        params["action"] = "execute"
+        params["instruction"] = " ".join(args_rest).strip()
+
+    if params.get("action") == "execute" and not params.get("instruction"):
+        console.print("[yellow]  Usage: /rby1 <instruction>[/]")
+        return True
+
+    result = tool.execute(params, context)
+    if result.is_error:
+        console.print(f"[red]  {result.content}[/]")
+    else:
+        console.print(result.content)
+    return True
+
+
+def _handle_rby1_direct_text(
+    user_input: str,
+    registry: ToolRegistry,
+    session: Session | None,
+    app_state: dict[str, Any] | None,
+) -> bool:
+    if not (app_state or {}).get("molmospaces_rby1_direct_text"):
+        return False
+    instruction = user_input.strip()
+    if not instruction:
+        return False
+    return _handle_rby1_slash_command(instruction.split(), registry, session, app_state)
+
+
 # ---------------------------------------------------------------------------
 # Hardware init
 # ---------------------------------------------------------------------------
@@ -721,7 +871,7 @@ def enter_scenario(scenario_id: str, app_state: dict[str, Any]) -> Any:
 
 
 def _init_agent(args: argparse.Namespace) -> Any:
-    if not (args.sim or args.sim_go2):
+    if not (args.sim or args.sim_go2 or getattr(args, "sim_g1", False)):
         return None
     try:
         from vector_os_nano.core.agent import Agent  # type: ignore[import]
@@ -740,6 +890,9 @@ def _init_agent(args: argparse.Namespace) -> Any:
                 perception=perception,
                 config={"skills": {"pick": dict(SIM_PICK_CONFIG)}},
             )
+        if getattr(args, "sim_g1", False):
+            from vector_os_nano.vcli.tools.sim_tool import SimStartTool
+            return SimStartTool._start_g1(backend="mujoco", gui=not getattr(args, "headless", False))
 
         # --- Go2 full stack: MuJoCo + ROS2 bridge + nav stack + VLM + Rerun ---
         from vector_os_nano.hardware.sim.mujoco_go2 import MuJoCoGo2  # type: ignore[import]
@@ -1054,6 +1207,9 @@ def _handle_slash_command(
                 tbl.add_row(f"[{TEAL}]{name}[/]", f"[dim]{ro}[/]", f"[dim]{desc}[/]")
             console.print(tbl)
             console.print()
+
+    elif cmd == "rby1":
+        return _handle_rby1_slash_command(args_rest, registry, session, app_state)
 
     elif cmd == "agent":
         console.print()
@@ -1375,10 +1531,10 @@ def _setup_explore_events(console: Any) -> None:
 def _wants_window(args: argparse.Namespace) -> bool:
     """Return True when the user wants a visible MuJoCo viewer window.
 
-    A window is wanted when --sim or --sim-go2 is active (NL-triggered sims are
+    A window is wanted when --sim / --sim-go2 / --sim-g1 is active (NL-triggered sims are
     handled separately in sim_tool.py) and --headless is NOT set.
     """
-    return (args.sim or args.sim_go2) and not getattr(args, "headless", False)
+    return (args.sim or args.sim_go2 or getattr(args, "sim_g1", False)) and not getattr(args, "headless", False)
 
 
 def _maybe_reexec_under_mjpython(args: argparse.Namespace) -> None:
@@ -1386,7 +1542,7 @@ def _maybe_reexec_under_mjpython(args: argparse.Namespace) -> None:
 
     Gates (ALL must be true for re-exec to fire):
     1. sys.platform == 'darwin'                 — macOS only
-    2. _wants_window(args)                      — --sim/--sim-go2 without --headless
+    2. _wants_window(args)                      — --sim/--sim-go2/--sim-g1 without --headless
     3. VECTOR_REEXEC != '1'                     — not already re-exec'd (loop guard)
     4. not running under pytest                 — never re-exec during tests
     5. mujoco.viewer._MJPYTHON is falsy         — not already under mjpython
@@ -1707,6 +1863,17 @@ def _build_turn_context(
         "robot_ctx_provider": robot_ctx_provider,
         "world": world,
         "scenario": _active_scenario,
+        "molmospaces_rby1_endpoint": {
+            "host": getattr(args, "molmospaces_rby1_host", "127.0.0.1"),
+            "port": getattr(args, "molmospaces_rby1_port", 8765),
+            "timeout_s": getattr(args, "molmospaces_rby1_timeout", 300.0),
+        },
+        "molmospaces_rby1_scene": getattr(args, "molmospaces_rby1_scene", None),
+        "molmospaces_rby1_viewer": bool(getattr(args, "molmospaces_rby1_viewer", False)),
+        "molmospaces_rby1_viewer_camera": getattr(
+            args, "molmospaces_rby1_viewer_camera", "free"
+        ),
+        "molmospaces_rby1_direct_text": bool(getattr(args, "molmospaces_rby1_direct_text", False)),
     }
     app_state["tool_permission_resolver"] = tool_permission_resolver or (
         lambda n, p: ask_permission(n, p)
@@ -1878,7 +2045,7 @@ def main(argv: list[str] | None = None) -> None:
             console = Console(stderr=True)
         _code = run_one_turn(args)
         # The verdict line is already flushed to stdout and the exit code is
-        # decided. A live sim (--sim/--sim-go2) leaves a MuJoCo physics daemon
+        # decided. A live sim (--sim/--sim-go2/--sim-g1) leaves a MuJoCo physics daemon
         # thread + ROS2 stack running whose interpreter-teardown can SIGABRT/segv
         # AFTER the verdict — corrupting the process exit code so it no longer
         # matches the (already-correct) verdict. For a single-use non-interactive
@@ -1886,7 +2053,7 @@ def main(argv: list[str] | None = None) -> None:
         # decided code (after flushing) to keep the harness invariant
         # ``verified == (exit_code == 0)`` honest. Interactive / non-sim turns are
         # unaffected (no daemon to crash). os._exit skips atexit/GC by design.
-        if getattr(args, "sim", False) or getattr(args, "sim_go2", False):
+        if getattr(args, "sim", False) or getattr(args, "sim_go2", False) or getattr(args, "sim_g1", False):
             try:
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -2032,6 +2199,17 @@ def main(argv: list[str] | None = None) -> None:
         "robot_ctx_provider": robot_ctx_provider,
         "world": world,
         "scenario": _active_scenario,
+        "molmospaces_rby1_endpoint": {
+            "host": getattr(args, "molmospaces_rby1_host", "127.0.0.1"),
+            "port": getattr(args, "molmospaces_rby1_port", 8765),
+            "timeout_s": getattr(args, "molmospaces_rby1_timeout", 300.0),
+        },
+        "molmospaces_rby1_scene": getattr(args, "molmospaces_rby1_scene", None),
+        "molmospaces_rby1_viewer": bool(getattr(args, "molmospaces_rby1_viewer", False)),
+        "molmospaces_rby1_viewer_camera": getattr(
+            args, "molmospaces_rby1_viewer_camera", "free"
+        ),
+        "molmospaces_rby1_direct_text": bool(getattr(args, "molmospaces_rby1_direct_text", False)),
     }
 
     # VGG cognitive layer (optional)
@@ -2214,6 +2392,10 @@ def main(argv: list[str] | None = None) -> None:
                         console.print("[yellow]Command timed out (30s)[/]")
                     except Exception as exc:
                         console.print(f"[red]Error:[/] {exc}")
+                continue
+
+            # ---- MolmoSpaces RBY1 direct text ----
+            if _handle_rby1_direct_text(user_input, registry, session, app_state):
                 continue
 
             # ---- Engine turn ----

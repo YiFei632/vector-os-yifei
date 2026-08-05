@@ -49,6 +49,40 @@ def test_navigate_target_list_form():
     assert (float(args[0]), float(args[1])) == (10.5, 3.0)
 
 
+def test_coordinate_prefers_explicit_navigation_service() -> None:
+    ctx = _ctx(arrived=True)
+    nav = MagicMock()
+    nav.is_available = True
+    nav.navigate_to.return_value = True
+    ctx.services["navigation"] = nav
+
+    res = NavigateSkill().execute({"x": 10.5, "y": 3.0}, ctx)
+
+    assert res.success
+    nav.navigate_to.assert_called_once()
+    ctx.base.navigate_to.assert_not_called()
+    assert res.result_data["mode"] == "nav_service_coord"
+
+
+def test_coordinate_works_with_g1_registry_name() -> None:
+    base = MagicMock()
+    base.name = "g1"
+    base.get_position.return_value = [1.0, 2.0, 0.8]
+    base.get_heading.return_value = 0.0
+    base.navigate_to.return_value = True
+    ctx = SkillContext(
+        bases={"g1": base},
+        default_base_name="g1",
+        world_model=WorldModel(),
+        services={},
+    )
+
+    res = NavigateSkill().execute({"x": 1.0, "y": 2.0}, ctx)
+
+    assert res.success
+    base.navigate_to.assert_called_once()
+
+
 def test_navigate_xy_no_base_fails_loud():
     ctx = SkillContext(world_model=WorldModel(), services={})
     res = NavigateSkill().execute({"x": 10.5, "y": 3.0}, ctx)

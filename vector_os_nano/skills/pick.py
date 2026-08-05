@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
+from numbers import Integral
 from typing import Optional
 
 import numpy as np
@@ -35,6 +37,16 @@ import numpy as np
 from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
 from vector_os_nano.skills.calibration import camera_to_base, load_calibration
+from vector_os_nano.skills.motion_profile import (
+    HeldObjectOwnershipError,
+    LIMB_PARAMETER,
+    MotionCapabilityError,
+    require_cartesian_control,
+    require_gripper_control,
+    require_no_held_object,
+    resolve_joint_pose,
+    select_limb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +67,12 @@ _DEFAULT_MAX_RETRIES: int = 2
 # detectable, so re-homing + re-detecting just repeats the same miss. Fail fast
 # (clearer + faster) instead of exhausting retries on an absent object. Transient
 # failures (ik_unreachable, move_failed, track_failed) still retry.
-_NO_RETRY_DIAGNOSES: frozenset[str] = frozenset({"object_not_found", "no_detections"})
+_TARGET_NOT_FOUND_DIAGNOSES: frozenset[str] = frozenset(
+    {"object_not_found", "no_detections"}
+)
+_NO_RETRY_DIAGNOSES: frozenset[str] = frozenset(
+    {*_TARGET_NOT_FOUND_DIAGNOSES, "no_gripper", "invalid_profile", "invalid_parameters"}
+)
 
 # Position sampling for density-cluster estimation (from _get_target_camera_pos)
 _DEFAULT_SAMPLE_COUNT: int = 20
@@ -117,6 +134,7 @@ class PickSkill:
     # planner; kernel rules 3 + 5). References the arm verify namespace.
     verify_hint: str = "holding_object()"
     parameters: dict = {
+        "arm": LIMB_PARAMETER,
         "object_id": {
             "type": "string",
             "required": False,
@@ -147,7 +165,9 @@ class PickSkill:
     failure_modes: list[str] = [
         "no_arm", "object_not_found", "no_detections", "no_3d_samples",
         "out_of_workspace", "ik_unreachable", "move_failed", "track_failed",
-        "calibration_error",
+        "calibration_error", "invalid_parameters", "invalid_profile",
+        "no_gripper", "gripper_failed", "capability_unavailable",
+        "already_holding",
     ]
 
     def execute(self, params: dict, context: SkillContext) -> SkillResult:
@@ -165,18 +185,114 @@ class PickSkill:
             SkillResult(success=True, result_data={"position_cm": [x, y]}) on success.
             SkillResult(success=False, error_message=...) on failure.
         """
-        if context.arm is None:
+        params = params or {}
+        try:
+            arm, gripper, arm_name = select_limb(context, params)
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "no_arm"},
+            )
+        if arm is None:
             return SkillResult(
                 success=False,
                 error_message="No arm connected",
                 result_data={"diagnosis": "no_arm"},
             )
 
+        try:
+            require_no_held_object(context)
+        except HeldObjectOwnershipError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "already_holding"},
+            )
+
+        try:
+            require_cartesian_control(arm)
+            if gripper is not None:
+                require_gripper_control(gripper)
+        except MotionCapabilityError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "capability_unavailable"},
+            )
+
+        try:
+            home_joints = resolve_joint_pose(
+                context,
+                "home",
+                _DEFAULT_HOME_JOINTS,
+                arm=arm,
+                arm_name=arm_name,
+            )
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "invalid_profile"},
+            )
+
+        cfg = context.config.get("skills", {}).get("pick", {})
+        pick_mode = params.get("mode", cfg.get("default_mode", "drop"))
+        if pick_mode not in {"hold", "drop"}:
+            return SkillResult(
+                success=False,
+                error_message=f"Unsupported pick mode: {pick_mode!r}",
+                result_data={"diagnosis": "invalid_parameters"},
+            )
+
+        drop_joints: list[float] | None = None
+        if pick_mode == "drop":
+            # The legacy SO-101 drop rotates joint 0 (shoulder pan).  Joint 0
+            # has a different meaning on G1 and other embodiments, so a named
+            # non-5-DoF arm must provide an explicit collision-reviewed pose.
+            declared_dof = getattr(arm, "dof", None)
+            arm_dof = (
+                int(declared_dof)
+                if isinstance(declared_dof, Integral) and int(declared_dof) > 0
+                else len(home_joints)
+            )
+            if arm_dof == len(_DEFAULT_HOME_JOINTS):
+                legacy_drop = list(home_joints)
+                legacy_drop[0] += 1.57
+                drop_joints = legacy_drop
+            else:
+                configured = cfg.get("drop_joint_values_by_arm", {})
+                if not (
+                    arm_name is not None
+                    and isinstance(configured, Mapping)
+                    and arm_name in configured
+                ):
+                    return SkillResult(
+                        success=False,
+                        error_message=(
+                            "Non-5-DoF pick mode='drop' requires "
+                            f"skills.pick.drop_joint_values_by_arm.{arm_name or '<arm>'}"
+                        ),
+                        result_data={"diagnosis": "invalid_profile"},
+                    )
+                try:
+                    drop_joints = resolve_joint_pose(
+                        context,
+                        "pick",
+                        home_joints,
+                        arm=arm,
+                        arm_name=arm_name,
+                        pose_key="drop_joint_values",
+                    )
+                except ValueError as exc:
+                    return SkillResult(
+                        success=False,
+                        error_message=str(exc),
+                        result_data={"diagnosis": "invalid_profile"},
+                    )
+
         max_retries: int = (
-            context.config.get("skills", {}).get("pick", {}).get("max_retries", _DEFAULT_MAX_RETRIES)
-        )
-        home_joints: list[float] = (
-            context.config.get("skills", {}).get("home", {}).get("joint_values", _DEFAULT_HOME_JOINTS)
+            cfg.get("max_retries", _DEFAULT_MAX_RETRIES)
         )
 
         last_error: str = "unknown error"
@@ -184,7 +300,16 @@ class PickSkill:
         last_result_data: dict = {}
         for attempt in range(1, max_retries + 1):
             logger.info("[PICK] Attempt %d/%d", attempt, max_retries)
-            result = self._single_pick_attempt(params, context)
+            result = self._single_pick_attempt(
+                params,
+                context,
+                arm=arm,
+                gripper=gripper,
+                arm_name=arm_name,
+                home_joints=home_joints,
+                pick_mode=pick_mode,
+                drop_joints=drop_joints,
+            )
             if result.success:
                 return result
             last_error = result.error_message
@@ -196,12 +321,21 @@ class PickSkill:
             # and re-detecting just repeats the same miss (e.g. asked for an object
             # that isn't in the scene). Fail fast and clearly.
             if last_diagnosis in _NO_RETRY_DIAGNOSES:
-                logger.info("[PICK] %s — target not detectable; not retrying", last_diagnosis)
+                logger.info("[PICK] %s — non-retryable failure", last_diagnosis)
                 break
 
             if attempt < max_retries:
                 logger.info("[PICK] Returning home for retry ...")
-                context.arm.move_joints(home_joints, duration=_HOME_DURATION)
+                if arm.move_joints(home_joints, duration=_HOME_DURATION) is False:
+                    return SkillResult(
+                        success=False,
+                        error_message="Pick recovery failed to return home",
+                        result_data={
+                            "diagnosis": "move_failed",
+                            "phase": "retry_home",
+                            "attempts": attempt,
+                        },
+                    )
                 time.sleep(1.0)
 
         # Merge retry metadata into the last attempt's result_data so callers
@@ -213,8 +347,12 @@ class PickSkill:
             "attempts": attempts_made,
             "hint": (
                 "Target not detectable — check the object is present/named correctly."
-                if last_diagnosis in _NO_RETRY_DIAGNOSES
-                else "All retry attempts exhausted."
+                if last_diagnosis in _TARGET_NOT_FOUND_DIAGNOSES
+                else (
+                    "The selected hardware/profile cannot execute this pick."
+                    if last_diagnosis in _NO_RETRY_DIAGNOSES
+                    else "All retry attempts exhausted."
+                )
             ),
         })
         return SkillResult(
@@ -231,26 +369,25 @@ class PickSkill:
         self,
         params: dict,
         context: SkillContext,
+        *,
+        arm: object,
+        gripper: object | None,
+        arm_name: str | None,
+        home_joints: list[float],
+        pick_mode: str,
+        drop_joints: list[float] | None,
     ) -> SkillResult:
         """Execute one pick attempt.  Full port of _single_pick_attempt().
 
         Returns SkillResult — does NOT retry on its own.
         """
-        # Always open gripper first — ensures clean grip regardless of current state
-        if context.gripper is not None:
-            logger.info("[PICK] Ensuring gripper is open ...")
-            context.gripper.open()
-
         cfg = context.config.get("skills", {}).get("pick", {})
         z_offset: float = cfg.get("z_offset", _DEFAULT_Z_OFFSET)
         x_offset: float = cfg.get("x_offset", 0.0)
         pre_grasp_h: float = cfg.get("pre_grasp_height", _DEFAULT_PRE_GRASP_HEIGHT)
-        home_joints: list[float] = (
-            context.config.get("skills", {}).get("home", {}).get("joint_values", _DEFAULT_HOME_JOINTS)
-        )
 
         # Step 1: Get target in base frame
-        base_pos_result = self._get_target_base_pos(params, context)
+        base_pos_result = self._get_target_base_pos(params, context, arm=arm)
         if base_pos_result is None:
             label = params.get("object_label") or params.get("object_id") or ""
             return SkillResult(
@@ -289,13 +426,24 @@ class PickSkill:
         )
 
         # Step 5: Workspace boundary check
+        try:
+            workspace_min = float(cfg.get("workspace_min_dist", _WORKSPACE_MIN_DIST))
+            workspace_max = float(cfg.get("workspace_max_dist", _WORKSPACE_MAX_DIST))
+        except (TypeError, ValueError):
+            workspace_min, workspace_max = -1.0, -1.0
+        if not (0.0 <= workspace_min < workspace_max):
+            return SkillResult(
+                success=False,
+                error_message="Pick workspace limits must satisfy 0 <= min < max",
+                result_data={"diagnosis": "invalid_profile"},
+            )
         dist_xy = float(np.linalg.norm(base_pos[:2]))
-        if dist_xy > _WORKSPACE_MAX_DIST or dist_xy < _WORKSPACE_MIN_DIST:
+        if dist_xy > workspace_max or dist_xy < workspace_min:
             return SkillResult(
                 success=False,
                 error_message=(
                     f"Object at ({base_pos[0]*100:.1f}, {base_pos[1]*100:.1f}) cm "
-                    f"outside workspace ({_WORKSPACE_MIN_DIST*100:.0f}–{_WORKSPACE_MAX_DIST*100:.0f} cm)"
+                    f"outside workspace ({workspace_min*100:.0f}–{workspace_max*100:.0f} cm)"
                 ),
                 result_data={
                     "diagnosis": "out_of_workspace",
@@ -306,8 +454,8 @@ class PickSkill:
                     ],
                     "distance_cm": round(dist_xy * 100, 1),
                     "workspace_bounds_cm": [
-                        int(_WORKSPACE_MIN_DIST * 100),
-                        int(_WORKSPACE_MAX_DIST * 100),
+                        int(workspace_min * 100),
+                        int(workspace_max * 100),
                     ],
                 },
             )
@@ -316,13 +464,13 @@ class PickSkill:
         # The calibration matrix + z_offset already account for real-world errors.
         # Do NOT try tip compensation — the URDF model doesn't match the real arm
         # accurately enough for model-based tip correction to help.
-        current_joints = context.arm.get_joint_positions()
+        current_joints = arm.get_joint_positions()
 
         # Pre-grasp position (higher Z)
         pre_grasp_pos = base_pos.copy()
         pre_grasp_pos[2] += pre_grasp_h
 
-        q_pregrasp_result = context.arm.ik(
+        q_pregrasp_result = arm.ik(
             (pre_grasp_pos[0], pre_grasp_pos[1], pre_grasp_pos[2]),
             current_joints,
         )
@@ -352,7 +500,7 @@ class PickSkill:
             q_pregrasp[4] += wrist_roll_offset
 
         # Grasp position (warm-started from pre-grasp for minimal joint change)
-        q_grasp_result = context.arm.ik(
+        q_grasp_result = arm.ik(
             (base_pos[0], base_pos[1], base_pos[2]),
             q_pregrasp,
         )
@@ -379,14 +527,28 @@ class PickSkill:
             pre_grasp_pos[2] * 100, base_pos[2] * 100,
         )
 
+        # Perception and IK are allowed to report their own diagnostics without
+        # a gripper, but no physical motion begins unless the selected arm has a
+        # same-side operational hand/gripper.
+        if gripper is None:
+            return SkillResult(
+                success=False,
+                error_message=f"No matching gripper/hand for arm {arm_name!r}",
+                result_data={"diagnosis": "no_gripper"},
+            )
+
         # Step 8: Open gripper
         logger.info("[PICK] Opening gripper ...")
-        if context.gripper is not None:
-            context.gripper.open()
+        if gripper.open() is False:
+            return SkillResult(
+                success=False,
+                error_message="Gripper failed to open before pick",
+                result_data={"diagnosis": "gripper_failed", "phase": "open"},
+            )
 
         # Step 9: Move to pre-grasp
         logger.info("[PICK] Moving to pre-grasp ...")
-        if not context.arm.move_joints(q_pregrasp, duration=_PREGRASP_DURATION):
+        if not arm.move_joints(q_pregrasp, duration=_PREGRASP_DURATION):
             return SkillResult(
                 success=False,
                 error_message="Pre-grasp move failed",
@@ -395,7 +557,7 @@ class PickSkill:
 
         # Step 10: Descend to grasp
         logger.info("[PICK] Descending to grasp ...")
-        if not context.arm.move_joints(q_grasp, duration=_DESCENT_DURATION):
+        if not arm.move_joints(q_grasp, duration=_DESCENT_DURATION):
             return SkillResult(
                 success=False,
                 error_message="Descent to grasp failed",
@@ -405,20 +567,34 @@ class PickSkill:
         # Step 11: Open → wait → Close gripper sequence
         # Open first to ensure full grip range, then close to grasp
         logger.info("[PICK] Gripper sequence: open → close ...")
-        if context.gripper is not None:
-            context.gripper.open()
-            time.sleep(0.3)
-            for _ in range(3):
-                context.gripper.close()
-                time.sleep(0.2)
+        if gripper.open() is False:
+            return SkillResult(
+                success=False,
+                error_message="Gripper failed to reopen at grasp",
+                result_data={"diagnosis": "gripper_failed", "phase": "grasp_open"},
+            )
+        time.sleep(0.3)
+        for _ in range(3):
+            if gripper.close() is False:
+                return SkillResult(
+                    success=False,
+                    error_message="Gripper failed to close on object",
+                    result_data={"diagnosis": "gripper_failed", "phase": "grasp_close"},
+                )
+            time.sleep(0.2)
 
         # Step 12: Lift straight back to pre-grasp (one move)
         logger.info("[PICK] Lifting ...")
-        context.arm.move_joints(q_pregrasp, duration=_LIFT_DURATION)
+        if arm.move_joints(q_pregrasp, duration=_LIFT_DURATION) is False:
+            return SkillResult(
+                success=False,
+                error_message="Lift after grasp failed",
+                result_data={"diagnosis": "move_failed", "phase": "lift"},
+            )
 
         # Step 13: Return home (holding object)
         logger.info("[PICK] Returning home ...")
-        if not context.arm.move_joints(home_joints, duration=_HOME_DURATION):
+        if not arm.move_joints(home_joints, duration=_HOME_DURATION):
             return SkillResult(
                 success=False,
                 error_message="Return home after pick failed",
@@ -426,40 +602,53 @@ class PickSkill:
             )
 
         # Step 14: Mode-dependent behavior
-        pick_mode = params.get("mode", cfg.get("default_mode", "drop"))
-
         if pick_mode == "hold":
             # Hold mode: keep object in gripper, ready for place command
             logger.info("[PICK] Holding object (mode=hold)")
         else:
             # Drop mode: rotate 90deg and drop outside workspace
-            drop_joints = list(home_joints)
-            drop_joints[0] = drop_joints[0] + 1.57  # shoulder_pan +90deg
+            assert drop_joints is not None  # validated before any motion
             logger.info("[PICK] Rotating to drop position ...")
-            context.arm.move_joints(drop_joints, duration=_HOME_DURATION)
+            if arm.move_joints(drop_joints, duration=_HOME_DURATION) is False:
+                return SkillResult(
+                    success=False,
+                    error_message="Move to drop position failed",
+                    result_data={"diagnosis": "move_failed", "phase": "drop"},
+                )
 
             logger.info("[PICK] Dropping object ...")
-            if context.gripper is not None:
-                context.gripper.open()
-                time.sleep(0.5)
-                context.gripper.close()
+            if gripper.open() is False:
+                return SkillResult(
+                    success=False,
+                    error_message="Gripper failed to release object",
+                    result_data={"diagnosis": "gripper_failed", "phase": "drop_open"},
+                )
+            time.sleep(0.5)
+            if gripper.close() is False:
+                return SkillResult(
+                    success=False,
+                    error_message="Gripper failed to close after drop",
+                    result_data={"diagnosis": "gripper_failed", "phase": "drop_close"},
+                )
 
             logger.info("[PICK] Returning home ...")
-            context.arm.move_joints(home_joints, duration=_HOME_DURATION)
+            if arm.move_joints(home_joints, duration=_HOME_DURATION) is False:
+                return SkillResult(
+                    success=False,
+                    error_message="Return home after drop failed",
+                    result_data={"diagnosis": "move_failed", "phase": "drop_home"},
+                )
 
-        # Remove only the picked object from world model
-        # (other objects are still valid; clearing all was a bug)
+        # Resolve the selected object for trace/evidence only.  WorldModel is
+        # mutated centrally by TaskExecutor.apply_skill_effects(), which knows
+        # whether this was hold or drop; mutating it here used to delete held
+        # objects before the executor could mark them as grasped.
         picked_id = params.get("object_id")
         if not picked_id:
             label = params.get("object_label", "")
             matches = context.world_model.get_objects_by_label(label)
             if matches:
                 picked_id = matches[0].object_id
-        if picked_id:
-            context.world_model.remove_object(picked_id)
-            logger.info("[PICK] Removed %s from world model", picked_id)
-        else:
-            logger.info("[PICK] No specific object to remove from world model")
 
         logger.info(
             "[PICK] Pick complete! Grasped at (%.1f, %.1f) cm",
@@ -485,6 +674,8 @@ class PickSkill:
                     round(base_pos[1] * 100, 2),
                 ],
                 "picked_object": resolved_target,
+                "picked_object_id": picked_id,
+                "arm": arm_name,
                 "diagnosis": "ok",
             },
         )
@@ -494,7 +685,11 @@ class PickSkill:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _nearest_object_name(context: SkillContext) -> Optional[str]:
+    def _nearest_object_name(
+        context: SkillContext,
+        *,
+        arm: object | None = None,
+    ) -> Optional[str]:
         """Return the name of the nearest free-body object in the sim scene.
 
         Used ONLY when NO target is bound (object_label/object/query/target/
@@ -507,7 +702,7 @@ class PickSkill:
         Returns the object name closest to the base origin by sqrt(x²+y²), or
         None when no free objects are present.
         """
-        arm = context.arm  # property: returns first arm or legacy field
+        arm = arm if arm is not None else context.arm
         if arm is None:
             return None
         try:
@@ -525,6 +720,8 @@ class PickSkill:
         self,
         params: dict,
         context: SkillContext,
+        *,
+        arm: object | None = None,
     ) -> Optional[np.ndarray]:
         """Resolve target object position in base frame.
 
@@ -551,8 +748,9 @@ class PickSkill:
             params.get("target"),
             params.get("object_id"),
         ])
-        if _no_target and hasattr(context.arm, "get_object_positions"):
-            nearest = self._nearest_object_name(context)
+        selected_arm = arm if arm is not None else context.arm
+        if _no_target and hasattr(selected_arm, "get_object_positions"):
+            nearest = self._nearest_object_name(context, arm=selected_arm)
             if nearest is not None:
                 logger.info("[PICK] no target bound -> nearest object %r", nearest)
                 # Inject the resolved name so the normal perception/world-model

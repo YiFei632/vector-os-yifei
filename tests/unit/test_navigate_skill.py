@@ -77,34 +77,35 @@ class TestNavigateSkillMetadata:
 
 
 class TestNavigateWithNavStack:
-    def test_proxy_navigate_to_used_when_available(self):
-        """Mode 0: base.navigate_to() takes priority when present (Go2ROS2Proxy)."""
+    def test_explicit_navigation_service_has_priority(self):
+        """An injected service wins over a robot-specific base planner."""
         from vector_os_nano.skills.navigate import NavigateSkill
         ctx = _make_context(with_nav=True)
         skill = NavigateSkill()
         result = skill.execute({"room": "kitchen"}, ctx)
         assert result.success
-        # Proxy mode: base.navigate_to called, NOT nav service
-        ctx.base.navigate_to.assert_called_once()
+        ctx.services["nav"].navigate_to.assert_called_once()
+        ctx.base.navigate_to.assert_not_called()
 
-    def test_proxy_receives_kitchen_coordinates(self):
+    def test_navigation_service_receives_kitchen_coordinates(self):
         from vector_os_nano.skills.navigate import NavigateSkill
         ctx = _make_context(with_nav=True)
         skill = NavigateSkill()
         result = skill.execute({"room": "kitchen"}, ctx)
-        args = ctx.base.navigate_to.call_args
+        args = ctx.services["nav"].navigate_to.call_args
         # Kitchen center is (17.0, 2.5)
         assert 15 < args[0][0] < 19
         assert 1 < args[0][1] < 4
 
-    def test_proxy_failure_falls_back_to_dead_reckoning(self):
+    def test_service_failure_is_reported_without_mixing_controllers(self):
         from vector_os_nano.skills.navigate import NavigateSkill
         ctx = _make_context(with_nav=True)
-        ctx.base.navigate_to.return_value = False
+        ctx.services["nav"].navigate_to.return_value = False
         skill = NavigateSkill()
         result = skill.execute({"room": "kitchen"}, ctx)
-        # Proxy failed → falls back to dead-reckoning (which also uses navigate_to for door chain)
-        assert ctx.base.navigate_to.called
+        assert not result.success
+        assert result.diagnosis_code == "navigation_failed"
+        ctx.base.navigate_to.assert_not_called()
 
     def test_nav_unavailable_falls_back_to_dead_reckoning(self):
         """nav service present but is_available=False -> falls back to dead-reckoning."""
@@ -222,6 +223,55 @@ class TestNavigateDeadReckoning:
         result = skill.execute({}, ctx)
         assert not result.success
         assert "unknown_room" in result.diagnosis_code
+
+
+class TestNavigateWaypointTruthfulness:
+    """The low-level fallback must not turn rejected/no-op motion into success."""
+
+    def test_rejected_turn_fails_immediately(self):
+        from vector_os_nano.skills.navigate import _navigate_to_waypoint
+
+        base = MagicMock()
+        base.get_position.return_value = [0.0, 0.0, 0.8]
+        base.get_heading.return_value = 0.0
+        base.walk.return_value = False
+
+        assert not _navigate_to_waypoint(base, 0.0, 1.0, "north")
+        base.walk.assert_called_once()
+
+    def test_rejected_forward_motion_fails(self):
+        from vector_os_nano.skills.navigate import _navigate_to_waypoint
+
+        base = MagicMock()
+        base.get_position.return_value = [0.0, 0.0, 0.8]
+        base.get_heading.return_value = 0.0
+        base.walk.return_value = False
+
+        assert not _navigate_to_waypoint(base, 1.0, 0.0, "east")
+        base.walk.assert_called_once()
+
+    def test_no_odometry_progress_is_not_arrival(self):
+        from vector_os_nano.skills.navigate import _navigate_to_waypoint
+
+        base = MagicMock()
+        base.get_position.return_value = [0.0, 0.0, 0.8]
+        base.get_heading.return_value = 0.0
+        base.walk.return_value = True
+
+        assert not _navigate_to_waypoint(base, 1.0, 0.0, "east")
+
+    def test_confirmed_odometry_arrival_succeeds(self):
+        from vector_os_nano.skills.navigate import _navigate_to_waypoint
+
+        base = MagicMock()
+        base.get_position.side_effect = [
+            [0.0, 0.0, 0.8],
+            [0.75, 0.0, 0.8],
+        ]
+        base.get_heading.return_value = 0.0
+        base.walk.return_value = True
+
+        assert _navigate_to_waypoint(base, 1.0, 0.0, "east")
 
 
 class TestNavigateFromGo2Package:

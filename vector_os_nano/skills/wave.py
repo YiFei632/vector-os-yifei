@@ -13,6 +13,14 @@ import time
 
 from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
+from vector_os_nano.skills.motion_profile import (
+    LIMB_PARAMETER,
+    MotionCapabilityError,
+    require_gripper_control,
+    require_joint_control,
+    resolve_joint_pose,
+    select_limb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,23 +52,70 @@ class WaveSkill:
     typical_duration_sec: float = 15.0
     # No meaningful state predicate — the always-safe truthy literal.
     verify_hint: str = "True"
-    parameters: dict = {}
+    parameters: dict = {"arm": LIMB_PARAMETER}
     preconditions: list[str] = []
     postconditions: list[str] = []
     effects: dict = {"is_moving": False}
-    failure_modes: list[str] = ["no_arm", "move_failed"]
+    failure_modes: list[str] = [
+        "no_arm", "move_failed", "gripper_failed", "invalid_profile",
+        "capability_unavailable",
+    ]
 
     def execute(self, params: dict, context: SkillContext) -> SkillResult:
-        if context.arm is None:
+        try:
+            arm, gripper, arm_name = select_limb(context, params)
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "no_arm"},
+            )
+        if arm is None:
             return SkillResult(
                 success=False,
                 error_message="No arm connected",
                 result_data={"diagnosis": "no_arm"},
             )
 
+        try:
+            require_joint_control(arm, label="arm")
+            if gripper is not None:
+                require_gripper_control(gripper)
+        except MotionCapabilityError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "capability_unavailable"},
+            )
+
+        try:
+            raised = resolve_joint_pose(
+                context, "wave", _RAISED, arm=arm, arm_name=arm_name,
+                pose_key="raised",
+            )
+            wave_left = resolve_joint_pose(
+                context, "wave", _WAVE_LEFT, arm=arm, arm_name=arm_name,
+                pose_key="wave_left",
+            )
+            wave_right = resolve_joint_pose(
+                context, "wave", _WAVE_RIGHT, arm=arm, arm_name=arm_name,
+                pose_key="wave_right",
+            )
+            home_joints = resolve_joint_pose(
+                context, "home",
+                [-0.014, -1.238, 0.562, 0.858, 0.311],
+                arm=arm, arm_name=arm_name,
+            )
+        except ValueError as exc:
+            return SkillResult(
+                success=False,
+                error_message=str(exc),
+                result_data={"diagnosis": "invalid_profile"},
+            )
+
         # 1. Raise arm
         logger.info("[WAVE] Raising arm")
-        if not context.arm.move_joints(_RAISED, duration=_RAISE_DURATION):
+        if not arm.move_joints(raised, duration=_RAISE_DURATION):
             return SkillResult(
                 success=False,
                 error_message="Failed to raise arm",
@@ -68,31 +123,53 @@ class WaveSkill:
             )
 
         # 2. Open gripper (open hand)
-        if context.gripper is not None:
-            context.gripper.open()
+        if gripper is not None and gripper.open() is False:
+            return SkillResult(
+                success=False,
+                error_message="Failed to open hand for wave",
+                result_data={"diagnosis": "gripper_failed", "phase": "open"},
+            )
 
         time.sleep(_PAUSE)
 
         # 3. Wave left-right
         for i in range(_WAVE_CYCLES):
             logger.info("[WAVE] Cycle %d/%d", i + 1, _WAVE_CYCLES)
-            if not context.arm.move_joints(_WAVE_LEFT, duration=_WAVE_DURATION):
-                break
+            if not arm.move_joints(wave_left, duration=_WAVE_DURATION):
+                return SkillResult(
+                    success=False,
+                    error_message="Wave-left motion failed",
+                    result_data={
+                        "diagnosis": "move_failed", "phase": "wave_left", "cycle": i + 1,
+                    },
+                )
             time.sleep(_PAUSE)
-            if not context.arm.move_joints(_WAVE_RIGHT, duration=_WAVE_DURATION):
-                break
+            if not arm.move_joints(wave_right, duration=_WAVE_DURATION):
+                return SkillResult(
+                    success=False,
+                    error_message="Wave-right motion failed",
+                    result_data={
+                        "diagnosis": "move_failed", "phase": "wave_right", "cycle": i + 1,
+                    },
+                )
             time.sleep(_PAUSE)
 
         # 4. Return to center, then home
-        context.arm.move_joints(_RAISED, duration=_WAVE_DURATION)
-
-        home_joints: list[float] = (
-            context.config
-            .get("skills", {})
-            .get("home", {})
-            .get("joint_values", [-0.014, -1.238, 0.562, 0.858, 0.311])
-        )
-        context.arm.move_joints(home_joints, duration=_RAISE_DURATION)
+        if not arm.move_joints(raised, duration=_WAVE_DURATION):
+            return SkillResult(
+                success=False,
+                error_message="Failed to return wave to center",
+                result_data={"diagnosis": "move_failed", "phase": "center"},
+            )
+        if not arm.move_joints(home_joints, duration=_RAISE_DURATION):
+            return SkillResult(
+                success=False,
+                error_message="Failed to return home after wave",
+                result_data={"diagnosis": "move_failed", "phase": "home"},
+            )
 
         logger.info("[WAVE] Done")
-        return SkillResult(success=True, result_data={"diagnosis": "ok"})
+        return SkillResult(
+            success=True,
+            result_data={"diagnosis": "ok", "arm": arm_name},
+        )

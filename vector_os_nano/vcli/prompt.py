@@ -97,6 +97,12 @@ Do NOT use start_simulation for Go2 -- use bash + launch_explore.sh instead.
 For SO-101 arm sim, use start_simulation(sim_type="arm"). This opens a viewer window by
 default. If 主人 says "headless" / "无窗口" / "no window" / "不要窗口", pass gui=false to
 start_simulation to suppress the window.
+For G1 room navigation, use start_simulation(sim_type="g1", backend="mujoco").
+Then accept terminal navigation commands like walk / turn / navigate and let the
+base move inside the simulated room.
+
+For MolmoSpaces RBY1 integration, use the molmospaces_rby1 tool to connect to
+the external runtime, inspect state, reset scenes, and forward instructions.
 
 Key files in this project:
 - scripts/go2_vnav_bridge.py: path follower, obstacle avoidance, terrain persistence
@@ -158,6 +164,15 @@ Working style:
 ROLE_PROMPT = ROBOT_ROLE_PROMPT
 TOOL_INSTRUCTIONS = ROBOT_TOOL_INSTRUCTIONS
 
+G1_CAPABILITY_BLOCK = """
+G1 robot:
+- Has dual arms and dual Dex3 hands.
+- Phase 1 supports room/object interaction and tabletop grasping.
+- Do not assume locomotion unless the backend explicitly supports it.
+- Door/fridge interaction may be unavailable unless the corresponding skills are registered.
+- If the MolmoSpaces RBY1 bridge tool is available, use it for external room-scene
+  integration by connecting, observing, resetting, and executing instructions.
+"""
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -238,6 +253,13 @@ def build_system_prompt(
         hw_text = _format_hardware(agent)
         if hw_text:
             blocks.append({"type": "text", "text": f"Current Hardware:\n{hw_text}"})
+            if _looks_like_g1(hw_text):
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": G1_CAPABILITY_BLOCK.strip(),
+                    }
+                )
 
     # -- Dynamic: available skills -------------------------------------------
     if agent is not None:
@@ -362,6 +384,12 @@ def _format_world(agent: Any) -> str:
     return "\n".join(lines)
 
 
+def _looks_like_g1(hw_text: str) -> bool:
+    """Heuristic for deciding whether the active robot is a G1 embodiment."""
+    text = hw_text.lower()
+    return "g1" in text or "dex3" in text
+
+
 # Project-context filenames recognized in the working directory, in precedence
 # order. VECTOR.md is Vector's own; AGENTS.md is the cross-tool standard; CLAUDE.md
 # is honored for repos already carrying one. The FIRST one found in cwd is used.
@@ -415,7 +443,6 @@ Principles:
 - When a step fails, say so plainly with the observation and re-plan — never paper over it.
 - Ask before irreversible or outward-facing actions; act decisively on reversible ones.
 - One identity across every embodiment and world; only the body and the task change."""
-
 
 def _load_personality() -> str:
     """Return the unified Vector personality block (kernel-owned, world-agnostic).

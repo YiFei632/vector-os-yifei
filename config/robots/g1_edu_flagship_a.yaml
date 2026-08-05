@@ -1,0 +1,103 @@
+# Unitree G1 EDU 旗舰版 A（rev-1.0 / mode_machine=5）
+#
+# The absolute root below matches this workspace.  On another machine set
+# VECTOR_G1_ASSET_ROOT to the directory containing the same URDF/XML/meshes.
+robot:
+  profile_id: g1_edu_flagship_a_rev_1_0
+  model_name: g1_29dof_with_hand_rev_1_0
+  mode_machine: 5
+  body_dof: 29
+  hand_model: dex3_1
+  hand_dof_per_side: 7
+  hands: [left, right]
+  waist_locked: false
+  wrist_motor: "4010"
+
+assets:
+  root_env: VECTOR_G1_ASSET_ROOT
+  root: /media/fishyu/fish-14tb-11/YiFei/unitree_ros/robots/g1_description
+  urdf: g1_29dof_with_hand_rev_1_0.urdf
+  mjcf: g1_29dof_with_hand_rev_1_0.xml
+  meshes: meshes
+  sha256:
+    urdf: 97da67732d067c3147fc5fb7b7bafc8982718f4e7f8c92ff82266a4d9c07200d
+    mjcf: 77c98e7d34e428c6cdbd1e0d665e989cbc43bf17abb8a7c048494b4bc51ead88
+
+frames:
+  root: pelvis
+  navigation: base_link
+  left_tcp: left_hand_palm_link
+  right_tcp: right_hand_palm_link
+
+defaults:
+  arm: right
+  hand: right
+
+control:
+  # Conservative phase-one limits; each backend may enforce lower limits.
+  max_vx: 0.6
+  max_vy: 0.4
+  max_vyaw: 1.0
+
+# Dex3 presets are in the HAL semantic order (not DDS/Isaac wire order):
+# thumb_0, thumb_1, thumb_2, index_0, index_1, middle_0, middle_1.
+poses:
+  left_hand_open: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  right_hand_open: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  left_hand_power_grasp: [0.35, 0.80, 1.40, -1.25, -1.40, -1.25, -1.40]
+  right_hand_power_grasp: [-0.35, -0.80, -1.40, 1.25, 1.40, 1.25, 1.40]
+  left_hand_pinch: [0.35, 0.75, 1.20, -1.00, -1.20, 0.0, 0.0]
+  right_hand_pinch: [-0.35, -0.75, -1.20, 1.00, 1.20, 0.0, 0.0]
+
+# Existing generic skills consume these named 7-DoF arm poses.  Home is based
+# on Unitree's current G129 Dex3 whole-body initial state.  Wave/scan are
+# conservative simulation seeds and must be collision-validated before real use.
+skills:
+  home:
+    joint_values_by_arm:
+      left: [0.35, 0.18, 0.0, 0.87, 0.0, 0.0, 0.0]
+      right: [0.35, -0.18, 0.0, 0.87, 0.0, 0.0, 0.0]
+  scan:
+    joint_values_by_arm:
+      left: [0.10, 0.25, 0.0, 1.10, 0.0, 0.0, 0.0]
+      right: [0.10, -0.25, 0.0, 1.10, 0.0, 0.0, 0.0]
+  wave:
+    raised_by_arm:
+      left: [-0.20, 1.00, 0.0, 1.30, 0.0, 0.0, 0.0]
+      right: [-0.20, -1.00, 0.0, 1.30, 0.0, 0.0, 0.0]
+    wave_left_by_arm:
+      left: [-0.20, 1.00, 0.0, 1.30, 0.0, 0.0, -0.50]
+      right: [-0.20, -1.00, 0.0, 1.30, 0.0, 0.0, -0.50]
+    wave_right_by_arm:
+      left: [-0.20, 1.00, 0.0, 1.30, 0.0, 0.0, 0.50]
+      right: [-0.20, -1.00, 0.0, 1.30, 0.0, 0.0, 0.50]
+  handover:
+    # Direction-specific seeds keep the legacy direction parameter meaningful
+    # without treating G1 shoulder pitch as SO-101 shoulder pan.
+    joint_values_left_by_arm:
+      left: [0.00, 0.65, -0.35, 1.10, 0.0, 0.0, 0.0]
+      right: [0.00, -0.65, -0.35, 1.10, 0.0, 0.0, 0.0]
+    joint_values_right_by_arm:
+      left: [0.00, 0.65, 0.35, 1.10, 0.0, 0.0, 0.0]
+      right: [0.00, -0.65, 0.35, 1.10, 0.0, 0.0, 0.0]
+  pick:
+    hardware_offsets: false
+    # Generic PickSkill targets are pelvis-relative for this profile. These
+    # bounds only gate IK requests; they do not replace collision checking.
+    workspace_min_dist: 0.10
+    workspace_max_dist: 0.70
+    default_mode: hold
+    # Required because G1 joint 0 is shoulder pitch, not SO-101 shoulder pan.
+    # These are conservative release seeds and must be scene collision-tested.
+    drop_joint_values_by_arm:
+      left: [0.00, 0.65, 0.0, 1.10, 0.0, 0.0, 0.0]
+      right: [0.00, -0.65, 0.0, 1.10, 0.0, 0.0, 0.0]
+
+simulation:
+  isaac:
+    task: Isaac-Move-Cylinder-G129-Dex3-Wholebody
+    controller_mode: whole_body
+  mujoco:
+    fixed_base_manipulation: false
+    locomotion: kinematic
+    room_layout: config/room_layout.yaml
