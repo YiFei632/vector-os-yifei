@@ -17,6 +17,7 @@ from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
 from vector_os_nano.integrations.molmospaces import MolmoSpacesRBY1Bridge
 from vector_os_nano.integrations.molmospaces.client import MolmoSpacesRBY1Error
+from vector_os_nano.integrations.molmospaces.perception import sync_scene_to_context
 from vector_os_nano.integrations.molmospaces.protocol import MolmoSpacesRBY1Endpoint
 
 
@@ -116,6 +117,36 @@ def _supported_bridge_items(metadata: dict[str, Any]) -> set[str]:
     return supported
 
 
+def _list_scene_objects(bridge: MolmoSpacesRBY1Bridge, config: dict[str, Any]) -> list[dict[str, Any]]:
+    result = bridge.execute(
+        "list scene objects",
+        context={**_runtime_context(config), "structured_action": "list_scene_objects"},
+        mode="structured",
+        timeout_s=float(config["endpoint"]["timeout_s"]),
+    )
+    objects = result.get("objects", [])
+    return [dict(obj) for obj in objects if isinstance(obj, dict)]
+
+
+def _object_matches(query: str, obj: dict[str, Any]) -> bool:
+    q = query.lower().strip()
+    if q in {"all", "all objects", "objects", "everything", "*"}:
+        return True
+    values = [
+        obj.get("name"),
+        obj.get("object_id"),
+        obj.get("label"),
+        obj.get("category"),
+        obj.get("natural_name"),
+    ]
+    values.extend(obj.get("aliases", []) or [])
+    for value in values:
+        text = str(value or "").lower().replace("_", " ").strip()
+        if text and (q == text or q in text or text in q):
+            return True
+    return False
+
+
 @skill(
     aliases=["rby1 observe", "observe rby1", "观察rby1", "查看rby1"],
     direct=False,
@@ -132,9 +163,85 @@ class RBY1ObserveSkill:
     def execute(self, params: dict, context: SkillContext) -> SkillResult:
         del params
         try:
-            bridge, _config = _bridge_for_context(context)
+            bridge, config = _bridge_for_context(context)
             state = bridge.observe()
+            try:
+                objects = _list_scene_objects(bridge, config)
+                state["objects"] = objects
+                state["scene_sync"] = sync_scene_to_context(context, objects)
+            except Exception as exc:  # noqa: BLE001
+                state["scene_sync_error"] = f"{type(exc).__name__}: {exc}"
             return SkillResult(success=True, result_data=state)
+        except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
+            return _bridge_error(exc)
+
+
+@skill(
+    aliases=["rby1 sync scene", "sync rby1 scene", "同步rby1场景", "同步场景"],
+    direct=False,
+)
+class RBY1SyncSceneSkill:
+    name = "rby1_sync_scene"
+    description = "Synchronize MolmoSpaces scene objects into Vector world model and scene graph."
+    parameters: dict[str, Any] = {}
+    preconditions: list[str] = ["MolmoSpaces RBY1 bridge server is running"]
+    postconditions: list[str] = ["MolmoSpaces scene objects are available in Vector world state"]
+    effects: dict[str, Any] = {}
+    failure_modes: list[str] = ["molmospaces_rby1_bridge_error"]
+
+    def execute(self, params: dict, context: SkillContext) -> SkillResult:
+        del params
+        try:
+            bridge, config = _bridge_for_context(context)
+            objects = _list_scene_objects(bridge, config)
+            sync = sync_scene_to_context(context, objects)
+            return SkillResult(success=True, result_data={"objects": objects, "scene_sync": sync})
+        except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
+            return _bridge_error(exc)
+
+
+@skill(
+    aliases=["rby1 detect", "detect rby1", "rby1 find", "rby1 找", "rby1 检测"],
+    direct=False,
+)
+class RBY1DetectObjectSkill:
+    name = "rby1_detect_object"
+    description = "Detect or look up objects in the MolmoSpaces RBY1 scene."
+    parameters: dict[str, Any] = {
+        "query": {
+            "type": "string",
+            "description": "Object query to detect or look up in the MolmoSpaces scene.",
+        }
+    }
+    preconditions: list[str] = ["MolmoSpaces RBY1 bridge server is running"]
+    postconditions: list[str] = ["Matching objects are returned and synchronized to Vector world state"]
+    effects: dict[str, Any] = {}
+    failure_modes: list[str] = ["missing_query", "no_detections", "molmospaces_rby1_bridge_error"]
+
+    def execute(self, params: dict, context: SkillContext) -> SkillResult:
+        query = _normalize_target(params.get("query") or params.get("object") or params.get("target"))
+        if not query:
+            return SkillResult(
+                success=False,
+                error_message="Missing RBY1 detection query",
+                diagnosis_code="missing_query",
+            )
+        try:
+            bridge, config = _bridge_for_context(context)
+            objects = _list_scene_objects(bridge, config)
+            sync = sync_scene_to_context(context, objects)
+            matches = [obj for obj in objects if _object_matches(query, obj)]
+            if not matches:
+                return SkillResult(
+                    success=False,
+                    result_data={"objects": objects, "scene_sync": sync, "query": query},
+                    error_message=f"No MolmoSpaces objects matched {query!r}",
+                    diagnosis_code="no_detections",
+                )
+            return SkillResult(
+                success=True,
+                result_data={"detections": matches, "objects": objects, "scene_sync": sync},
+            )
         except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
             return _bridge_error(exc)
 
@@ -186,7 +293,7 @@ class RBY1NavigateToObjectSkill:
                     "structured_action": "navigate_to_object",
                     "target": target,
                     "target_types": [target],
-                    "allow_execute_reset": True,
+                    "allow_execute_reset": False,
                 }
             )
             result = bridge.execute(
@@ -287,6 +394,75 @@ class RBY1PickObjectSkill:
         return SkillResult(success=success, result_data=result)
 
 
+@skill(
+    aliases=["rby1 place", "rby1 put", "place rby1", "rby1 放置", "rby1 放到"],
+    direct=False,
+)
+class RBY1PlaceObjectSkill:
+    name = "rby1_place_object"
+    description = "Place a held object onto or near a target in the MolmoSpaces RBY1 scene when supported."
+    typical_duration_sec = 120.0
+    parameters: dict[str, Any] = {
+        "object": {
+            "type": "string",
+            "required": False,
+            "description": "Held object to place.",
+        },
+        "target": {
+            "type": "string",
+            "description": "Placement target, such as table, counter, bowl, or receptacle.",
+        },
+    }
+    preconditions: list[str] = ["RBY1 is holding an object", "MolmoSpaces manipulation policy is available"]
+    postconditions: list[str] = ["The object is placed at the requested target"]
+    effects: dict[str, Any] = {"arm": "move", "gripper": "open"}
+    failure_modes: list[str] = ["missing_target", "manipulation_unsupported", "molmospaces_rby1_bridge_error"]
+
+    def execute(self, params: dict, context: SkillContext) -> SkillResult:
+        target = _normalize_target(params.get("target") or params.get("destination") or params.get("receptacle"))
+        obj = _normalize_target(params.get("object") or "")
+        if not target:
+            return SkillResult(
+                success=False,
+                error_message="Missing RBY1 placement target",
+                diagnosis_code="missing_target",
+            )
+        try:
+            bridge, config = _bridge_for_context(context)
+            metadata = bridge.connect()
+            supported = _supported_bridge_items(metadata)
+            if not any(item in supported for item in ("place", "place_object", "manipulation")):
+                return SkillResult(
+                    success=False,
+                    result_data={"bridge": metadata, "object": obj, "target": target},
+                    error_message=(
+                        "MolmoSpaces RBY1 bridge is reachable, but this adapter "
+                        "does not advertise place/manipulation support yet."
+                    ),
+                    diagnosis_code="manipulation_unsupported",
+                )
+            runtime_context = _runtime_context(config)
+            runtime_context.update(
+                {
+                    "structured_action": "place_object",
+                    "object": obj,
+                    "target": target,
+                    "target_types": [target],
+                    "allow_execute_reset": False,
+                }
+            )
+            result = bridge.execute(
+                f"place {obj or 'the object'} on the {target}",
+                context=runtime_context,
+                mode="structured",
+                timeout_s=float(config["endpoint"]["timeout_s"]),
+            )
+            success = bool(result.get("success"))
+            return SkillResult(success=success, result_data=result)
+        except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
+            return _bridge_error(exc)
+
+
 @skill(aliases=["rby1 stop", "stop rby1", "停止rby1"], direct=True)
 class RBY1StopSkill:
     name = "rby1_stop"
@@ -308,8 +484,11 @@ class RBY1StopSkill:
 
 
 __all__ = [
+    "RBY1DetectObjectSkill",
     "RBY1NavigateToObjectSkill",
     "RBY1ObserveSkill",
     "RBY1PickObjectSkill",
+    "RBY1PlaceObjectSkill",
+    "RBY1SyncSceneSkill",
     "RBY1StopSkill",
 ]

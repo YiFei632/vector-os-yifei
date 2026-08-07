@@ -340,6 +340,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Route recognized non-slash text input through structured MolmoSpaces RBY1 skills",
     )
+    parser.add_argument(
+        "--molmospaces-rby1-vgg",
+        action="store_true",
+        help="Use MolmoSpaces RBY1 as a structured VGG robot embodiment",
+    )
     parser.add_argument("--model", default=None, help="Model to use (overrides config; default reads ~/.vector/config.yaml)")
     parser.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume session")
     parser.add_argument("--api-key", default=None, help="API key (or set ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
@@ -816,6 +821,38 @@ def _configure_rby1_agent_services(agent: Any, args: argparse.Namespace) -> None
     services["molmospaces_rby1"] = _rby1_service_config_from_args(args)
 
 
+def _configure_rby1_vgg_agent(agent: Any, args: argparse.Namespace) -> None:
+    if agent is None or not bool(getattr(args, "molmospaces_rby1_vgg", False)):
+        return
+    from vector_os_nano.core.skill import SkillRegistry
+    from vector_os_nano.skills.molmospaces_rby1 import (
+        RBY1DetectObjectSkill,
+        RBY1NavigateToObjectSkill,
+        RBY1ObserveSkill,
+        RBY1PickObjectSkill,
+        RBY1PlaceObjectSkill,
+        RBY1SyncSceneSkill,
+        RBY1StopSkill,
+    )
+
+    registry = SkillRegistry()
+    for skill in (
+        RBY1ObserveSkill(),
+        RBY1SyncSceneSkill(),
+        RBY1DetectObjectSkill(),
+        RBY1NavigateToObjectSkill(),
+        RBY1PickObjectSkill(),
+        RBY1PlaceObjectSkill(),
+        RBY1StopSkill(),
+    ):
+        registry.register(skill)
+    agent._skill_registry = registry
+    agent._molmospaces_rby1_vgg = True
+    from vector_os_nano.integrations.molmospaces.perception import MolmoSpacesRBY1Perception
+
+    agent._perception = MolmoSpacesRBY1Perception(_rby1_service_config_from_args(args))
+
+
 def _strip_rby1_article(value: str) -> str:
     text = re.sub(r"^(?:the|a|an)\s+", "", value.strip(), flags=re.IGNORECASE).strip()
     aliases = {
@@ -1033,7 +1070,9 @@ def enter_scenario(scenario_id: str, app_state: dict[str, Any]) -> Any:
 
 def _init_agent(args: argparse.Namespace) -> Any:
     if not (args.sim or args.sim_go2 or getattr(args, "sim_g1", False)):
-        if bool(getattr(args, "molmospaces_rby1_agent_text", False)):
+        if bool(getattr(args, "molmospaces_rby1_agent_text", False)) or bool(
+            getattr(args, "molmospaces_rby1_vgg", False)
+        ):
             try:
                 from vector_os_nano.core.agent import Agent  # type: ignore[import]
 
@@ -1919,6 +1958,7 @@ def _build_turn_context(
     # BEFORE the verifier namespace is built, so the merge picks up its predicates.
     agent = _init_agent(args)
     _configure_rby1_agent_services(agent, args)
+    _configure_rby1_vgg_agent(agent, args)
     world = _resolve_active_world(args, agent)
 
     # Tools (categorized registry for scalable tool management)
@@ -2044,6 +2084,7 @@ def _build_turn_context(
         ),
         "molmospaces_rby1_direct_text": bool(getattr(args, "molmospaces_rby1_direct_text", False)),
         "molmospaces_rby1_agent_text": bool(getattr(args, "molmospaces_rby1_agent_text", False)),
+        "molmospaces_rby1_vgg": bool(getattr(args, "molmospaces_rby1_vgg", False)),
     }
     app_state["tool_permission_resolver"] = tool_permission_resolver or (
         lambda n, p: ask_permission(n, p)
@@ -2256,6 +2297,7 @@ def main(argv: list[str] | None = None) -> None:
     # BEFORE the verifier namespace is built, so the merge picks up its predicates.
     agent = _init_agent(args)
     _configure_rby1_agent_services(agent, args)
+    _configure_rby1_vgg_agent(agent, args)
     world = _resolve_active_world(args, agent)
 
     # Tools (categorized registry for scalable tool management)
@@ -2382,6 +2424,7 @@ def main(argv: list[str] | None = None) -> None:
         ),
         "molmospaces_rby1_direct_text": bool(getattr(args, "molmospaces_rby1_direct_text", False)),
         "molmospaces_rby1_agent_text": bool(getattr(args, "molmospaces_rby1_agent_text", False)),
+        "molmospaces_rby1_vgg": bool(getattr(args, "molmospaces_rby1_vgg", False)),
     }
 
     # VGG cognitive layer (optional)
@@ -2594,7 +2637,11 @@ def main(argv: list[str] | None = None) -> None:
             # (route through the nav-stack instead of the open-loop walk) and LATENCY
             # are tracked native improvements (see docs/ARCHITECTURE.md), NOT reasons to
             # fall back to legacy.
-            if _repl_native_enabled() and _intent_actionable(engine, user_input):
+            if (
+                not app_state.get("molmospaces_rby1_vgg")
+                and _repl_native_enabled()
+                and _intent_actionable(engine, user_input)
+            ):
                 if _repl_attempt_native(engine, user_input, session, app_state, console):
                     continue
                 # native took NO action -> fall through to legacy routing (unchanged).

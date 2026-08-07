@@ -7,9 +7,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from vector_os_nano.vcli.cli import (
+    _configure_rby1_agent_services,
+    _configure_rby1_vgg_agent,
     _handle_rby1_agent_text,
     _handle_rby1_direct_text,
     _handle_rby1_slash_command,
+    _init_agent,
     _parse_rby1_agent_text,
 )
 from vector_os_nano.vcli.tools.base import ToolResult
@@ -156,3 +159,35 @@ def test_rby1_agent_text_routes_structured_skill_sequence_when_enabled() -> None
     assert ok is True
     assert nav_tool.calls[0]["params"] == {"target": "table"}
     assert pick_tool.calls[0]["params"] == {"object": "mug"}
+
+
+def test_rby1_vgg_agent_registers_only_rby1_skills() -> None:
+    args = SimpleNamespace(
+        sim=False,
+        sim_go2=False,
+        sim_g1=False,
+        molmospaces_rby1_agent_text=False,
+        molmospaces_rby1_vgg=True,
+        molmospaces_rby1_host="127.0.0.1",
+        molmospaces_rby1_port=8765,
+        molmospaces_rby1_timeout=300.0,
+        molmospaces_rby1_scene=None,
+        molmospaces_rby1_viewer=False,
+        molmospaces_rby1_viewer_camera="free",
+    )
+
+    agent = _init_agent(args)
+    _configure_rby1_agent_services(agent, args)
+    _configure_rby1_vgg_agent(agent, args)
+
+    assert getattr(agent, "_molmospaces_rby1_vgg") is True
+    assert set(agent._skill_registry.list_skills()) == {
+        "rby1_observe",
+        "rby1_sync_scene",
+        "rby1_detect_object",
+        "rby1_navigate_to_object",
+        "rby1_pick_object",
+        "rby1_place_object",
+        "rby1_stop",
+    }
+    assert agent._perception is not None

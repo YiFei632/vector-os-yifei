@@ -4,7 +4,7 @@
 """RobotWorld.register_capabilities — registers the learned 'detect' capability.
 
 Guarded two ways (keeps dev/go2-only/CI byte-identical):
-  - only when the agent has an arm (the detector drives the manipulation route);
+  - only when the agent has an arm, or a bridge embodiment with perception;
   - only when torch/transformers are importable.
 The model is NOT loaded by registration (DetectorCapability is lazy), so this
 runs without weights. We monkeypatch around the torch import-guard so the test
@@ -34,6 +34,13 @@ class _ArmAgent:
 class _BaseOnlyAgent:
     def __init__(self):
         self._arm = None  # go2 base only, no arm
+
+
+class _RBY1BridgeAgent:
+    def __init__(self, perception=None):
+        self._arm = None
+        self._perception = perception
+        self._molmospaces_rby1_vgg = True
 
 
 def _torch_present() -> bool:
@@ -73,6 +80,25 @@ def test_detect_capability_bound_to_agent_perception():
     cap = reg.get("detect")
     assert cap is not None
     assert getattr(cap, "_perception", None) is perc
+
+
+def test_rby1_bridge_agent_registers_detect_when_perception_present():
+    if not _torch_present():
+        reg = CapabilityRegistry()
+        RobotWorld().register_capabilities(reg, _RBY1BridgeAgent(perception=_Perc()), backend=None)
+        assert "detect" not in reg.names()
+        return
+    perc = _Perc()
+    reg = CapabilityRegistry()
+    RobotWorld().register_capabilities(reg, _RBY1BridgeAgent(perception=perc), backend=None)
+    assert "detect" in reg.names()
+    assert getattr(reg.get("detect"), "_perception", None) is perc
+
+
+def test_rby1_bridge_agent_without_perception_registers_nothing():
+    reg = CapabilityRegistry()
+    RobotWorld().register_capabilities(reg, _RBY1BridgeAgent(perception=None), backend=None)
+    assert "detect" not in reg.names()
 
 
 def test_base_only_agent_registers_nothing():

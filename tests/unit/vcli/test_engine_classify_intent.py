@@ -88,6 +88,22 @@ def test_route_tool_use_when_robot_world_not_ready() -> None:
     assert d.reason == "robot-world-not-ready"
 
 
+def test_route_vgg_for_molmospaces_rby1_bridge_agent_without_local_base_or_arm() -> None:
+    world = SimpleNamespace(is_robot=lambda: True)
+    agent = SimpleNamespace(
+        _base=None,
+        _arm=None,
+        _skill_registry=None,
+        _molmospaces_rby1_vgg=True,
+    )
+    eng = _make_engine(_vgg_enabled=True, _world=world, _vgg_agent=agent)
+
+    d = eng.classify_intent("走到桌子")
+
+    assert d.route == "vgg"
+    assert d.reason == "vgg-actionable"
+
+
 def test_route_tool_use_for_pure_conversation() -> None:
     # dev world (not robot): gate rejects a plain greeting
     world = SimpleNamespace(is_robot=lambda: False)

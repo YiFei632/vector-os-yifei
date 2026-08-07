@@ -102,7 +102,7 @@ conda activate vector-os-nano
 vector-cli \
   --molmospaces-rby1-host 127.0.0.1 \
   --molmospaces-rby1-port 8765 \
-  --molmospaces-rby1-agent-text
+  --molmospaces-rby1-vgg
 ```
 
 Then use:
@@ -114,16 +114,50 @@ Then use:
 /rby1 go to the table and pick up the mug
 ```
 
-With `--molmospaces-rby1-agent-text`, recognized non-slash input is parsed into
-structured RBY1 skills before execution, so this also works:
+With `--molmospaces-rby1-vgg`, the CLI creates a lightweight RBY1 Agent whose
+skill registry contains only MolmoSpaces RBY1 skills. Non-slash input then goes
+through the normal VGG path (`GoalDecomposer -> StrategySelector -> GoalExecutor`)
+against that RBY1 skill vocabulary:
 
 ```text
 go to the table and pick up the mug
 走到桌子并拿起杯子
 ```
 
+For deterministic parser testing, `--molmospaces-rby1-agent-text` is also
+available. It handles the same common navigation/pick phrases through a small
+rule parser and still executes the structured RBY1 skills.
+
 For bridge debugging, `--molmospaces-rby1-direct-text` is still available. It
 forwards non-slash input as one opaque instruction and bypasses skill planning.
+
+The RBY1-VGG embodiment exposes these structured skills:
+
+```text
+rby1_observe
+rby1_sync_scene
+rby1_detect_object
+rby1_navigate_to_object
+rby1_pick_object
+rby1_place_object
+rby1_stop
+```
+
+`rby1_observe` and `rby1_sync_scene` synchronize MolmoSpaces scene objects into
+Vector's world model / scene graph. `rby1_detect_object` uses the bridge-backed
+perception source: it tries MolmoSpaces RGB + Grounding-DINO when RGB rendering
+is available, and falls back to MolmoSpaces ground-truth scene objects when the
+GUI viewer owns the GL context.
+
+The current reference adapter advertises navigation, RGB observation, and scene
+object state. Pick/place skills are present as structured VGG actions, but they
+return an honest `manipulation_unsupported` result until a CuRobo-backed
+MolmoSpaces manipulation adapter advertises `pick_object` / `place_object`.
+
+For an already loaded scene, structured navigation retargets the active
+`nav_to_obj` task in place and replans A*. It does not resample or reload the
+MuJoCo scene when the user changes targets, so consecutive commands such as
+`go to the table` and `go to the refrigerator` keep the same scene instance.
 
 ## Minimal adapter skeleton
 

@@ -99,12 +99,19 @@ class RobotWorld:
         #
         # Guarded two ways so dev / go2-only / CI without weights stay byte-identical:
         #   1. torch/transformers must be importable (ImportError -> register nothing);
-        #   2. the agent must actually have an arm (the detector only drives the
-        #      manipulation route) — a base-only go2 or a no-agent probe registers
-        #      nothing. World-agnostic: an arm-presence CAPABILITY check, not an
-        #      embodiment special-case. The model itself is NOT loaded here — the
+        #   2. the agent must expose a perception-bearing manipulation embodiment:
+        #      either a local arm, or the MolmoSpaces RBY1 bridge VGG marker plus a
+        #      bridge perception source. A base-only go2 or a no-agent probe still
+        #      registers nothing. The model itself is NOT loaded here — the
         #      DetectorCapability/GroundingDinoDetector loads lazily on first detect.
-        if agent is None or getattr(agent, "_arm", None) is None:
+        if agent is None:
+            return None
+        perception = getattr(agent, "_perception", None)
+        has_local_arm = getattr(agent, "_arm", None) is not None
+        has_rby1_bridge_perception = bool(
+            getattr(agent, "_molmospaces_rby1_vgg", False) and perception is not None
+        )
+        if not (has_local_arm or has_rby1_bridge_perception):
             return None
         try:
             import torch  # noqa: F401
@@ -130,7 +137,6 @@ class RobotWorld:
         # invoke time; a cold product turn (sim started this same turn) then perceives
         # with no pre-boot. We still pass the snapshot perception when present (it
         # wins in _live_perception, keeping the warm path identical).
-        perception = getattr(agent, "_perception", None)
         registry.register(DetectorCapability(perception=perception, agent=agent))
         logger.info(
             "[ROBOT-WORLD] registered 'detect' capability (grounding-dino), "

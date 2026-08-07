@@ -1072,11 +1072,15 @@ class VectorEngine:
             _is_robot = bool(_world.is_robot())
         else:
             _is_robot = _agent is not None  # back-compat: agent present => robot
+        _bridge_robot_ready = bool(
+            _agent is not None and getattr(_agent, "_molmospaces_rby1_vgg", False)
+        )
         if _is_robot and (
             _agent is None
             or (
                 getattr(_agent, "_base", None) is None
                 and getattr(_agent, "_arm", None) is None
+                and not _bridge_robot_ready
             )
         ):
             return IntentDecision(
@@ -1225,8 +1229,12 @@ class VectorEngine:
                 return None
         if "object_label" in skill_params and extracted:
             params["object_label"] = extracted
+        if "object" in skill_params and extracted:
+            params["object"] = extracted
         if "query" in skill_params and extracted:
             params["query"] = extracted
+        if "target" in skill_params and extracted:
+            params["target"] = extracted
 
         sub_goal = SubGoal(
             name=f"{skill_name}_goal",
@@ -1234,7 +1242,9 @@ class VectorEngine:
             verify=verify,
             strategy=f"{skill_name}_skill",
             strategy_params=params,
-            timeout_sec=60.0 if skill_name in ("navigate", "explore", "patrol") else 30.0,
+            timeout_sec=120.0
+            if skill_name in ("navigate", "explore", "patrol", "rby1_navigate_to_object", "rby1_pick_object")
+            else 30.0,
         )
         return GoalTree(goal=user_message, sub_goals=(sub_goal,))
 
