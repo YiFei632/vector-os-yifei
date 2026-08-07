@@ -9,6 +9,12 @@ from vector_os_nano.skills.detect import DetectSkill
 from vector_os_nano.skills.gripper import GripperCloseSkill, GripperOpenSkill
 from vector_os_nano.skills.handover import HandoverSkill
 from vector_os_nano.skills.home import HomeSkill
+from vector_os_nano.skills.molmospaces_rby1 import (
+    RBY1NavigateToObjectSkill,
+    RBY1ObserveSkill,
+    RBY1PickObjectSkill,
+    RBY1StopSkill,
+)
 from vector_os_nano.skills.pick import PickSkill
 from vector_os_nano.skills.place import PlaceSkill
 from vector_os_nano.skills.scan import ScanSkill
@@ -23,6 +29,10 @@ __all__ = [
     "HomeSkill",
     "PickSkill",
     "PlaceSkill",
+    "RBY1NavigateToObjectSkill",
+    "RBY1ObserveSkill",
+    "RBY1PickObjectSkill",
+    "RBY1StopSkill",
     "ScanSkill",
     "WaveSkill",
     "get_default_skills",
@@ -39,6 +49,10 @@ def get_default_skills() -> list:
         PickSkill(),
         PlaceSkill(),
         HandoverSkill(),
+        RBY1ObserveSkill(),
+        RBY1NavigateToObjectSkill(),
+        RBY1PickObjectSkill(),
+        RBY1StopSkill(),
         GripperOpenSkill(),
         GripperCloseSkill(),
         WaveSkill(),

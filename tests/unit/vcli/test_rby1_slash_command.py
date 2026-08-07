@@ -6,7 +6,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from vector_os_nano.vcli.cli import _handle_rby1_direct_text, _handle_rby1_slash_command
+from vector_os_nano.vcli.cli import (
+    _handle_rby1_agent_text,
+    _handle_rby1_direct_text,
+    _handle_rby1_slash_command,
+    _parse_rby1_agent_text,
+)
 from vector_os_nano.vcli.tools.base import ToolResult
 
 
@@ -24,6 +29,8 @@ class _FakeRegistry:
         self._tool = tool
 
     def get(self, name: str):
+        if isinstance(self._tool, dict):
+            return self._tool.get(name)
         if name == "molmospaces_rby1":
             return self._tool
         return None
@@ -108,3 +115,44 @@ def test_rby1_direct_text_routes_plain_input_when_enabled() -> None:
     params = tool.calls[0]["params"]
     assert params["action"] == "execute"
     assert params["instruction"] == "go to the table and pick up the mug"
+
+
+def test_rby1_agent_text_parser_splits_navigation_and_pick() -> None:
+    assert _parse_rby1_agent_text("go to the table and pick up the mug") == [
+        ("rby1_navigate_to_object", {"target": "table"}),
+        ("rby1_pick_object", {"object": "mug"}),
+    ]
+
+
+def test_rby1_agent_text_parser_accepts_chinese_navigation_and_pick() -> None:
+    assert _parse_rby1_agent_text("走到桌子并拿起杯子") == [
+        ("rby1_navigate_to_object", {"target": "table"}),
+        ("rby1_pick_object", {"object": "mug"}),
+    ]
+
+
+def test_rby1_agent_text_routes_structured_skill_sequence_when_enabled() -> None:
+    nav_tool = _FakeTool()
+    pick_tool = _FakeTool()
+    registry = _FakeRegistry(
+        {
+            "rby1_navigate_to_object": nav_tool,
+            "rby1_pick_object": pick_tool,
+        }
+    )
+    app_state = {
+        "agent": None,
+        "engine": None,
+        "molmospaces_rby1_agent_text": True,
+    }
+
+    ok = _handle_rby1_agent_text(
+        "go to the table and pick up the mug",
+        registry,
+        session=None,
+        app_state=app_state,
+    )
+
+    assert ok is True
+    assert nav_tool.calls[0]["params"] == {"target": "table"}
+    assert pick_tool.calls[0]["params"] == {"object": "mug"}

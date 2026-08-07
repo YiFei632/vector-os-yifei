@@ -335,6 +335,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Route non-slash text input directly to the MolmoSpaces RBY1 bridge",
     )
+    parser.add_argument(
+        "--molmospaces-rby1-agent-text",
+        action="store_true",
+        help="Route recognized non-slash text input through structured MolmoSpaces RBY1 skills",
+    )
     parser.add_argument("--model", default=None, help="Model to use (overrides config; default reads ~/.vector/config.yaml)")
     parser.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume session")
     parser.add_argument("--api-key", default=None, help="API key (or set ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
@@ -784,6 +789,162 @@ def _handle_rby1_direct_text(
     return _handle_rby1_slash_command(instruction.split(), registry, session, app_state)
 
 
+def _rby1_service_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    runtime_context: dict[str, Any] = {}
+    if bool(getattr(args, "molmospaces_rby1_viewer", False)):
+        runtime_context["viewer"] = True
+        viewer_camera = getattr(args, "molmospaces_rby1_viewer_camera", "free")
+        if viewer_camera:
+            runtime_context["viewer_camera"] = viewer_camera
+    return {
+        "endpoint": {
+            "host": getattr(args, "molmospaces_rby1_host", "127.0.0.1"),
+            "port": getattr(args, "molmospaces_rby1_port", 8765),
+            "timeout_s": getattr(args, "molmospaces_rby1_timeout", 300.0),
+        },
+        "scene_name": getattr(args, "molmospaces_rby1_scene", None),
+        "context": runtime_context,
+    }
+
+
+def _configure_rby1_agent_services(agent: Any, args: argparse.Namespace) -> None:
+    if agent is None:
+        return
+    services = getattr(agent, "_services", None)
+    if not isinstance(services, dict):
+        return
+    services["molmospaces_rby1"] = _rby1_service_config_from_args(args)
+
+
+def _strip_rby1_article(value: str) -> str:
+    text = re.sub(r"^(?:the|a|an)\s+", "", value.strip(), flags=re.IGNORECASE).strip()
+    aliases = {
+        "桌子": "table",
+        "餐桌": "table",
+        "桌边": "table",
+        "杯子": "mug",
+        "马克杯": "mug",
+        "水杯": "mug",
+        "椅子": "chair",
+        "沙发": "sofa",
+        "冰箱": "refrigerator",
+        "瓶子": "bottle",
+        "苹果": "apple",
+        "碗": "bowl",
+    }
+    return aliases.get(text, text)
+
+
+def _parse_rby1_agent_text(user_input: str) -> list[tuple[str, dict[str, Any]]] | None:
+    text = user_input.strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if "rby1" not in lower and not any(
+        kw in lower
+        for kw in (
+            "go to",
+            "navigate to",
+            "walk to",
+            "move to",
+            "pick up",
+            "grab",
+            "走到",
+            "导航到",
+            "移动到",
+            "去",
+            "拿起",
+            "抓取",
+            "抓",
+        )
+    ):
+        return None
+
+    steps: list[tuple[str, dict[str, Any]]] = []
+    nav_match = re.search(
+        r"\b(?:go|navigate|walk|move)\s+to\s+(?:the\s+|a\s+|an\s+)?"
+        r"(?P<target>[a-z0-9_\- ]+?)(?:\s+and\s+|\s+then\s+|,|$)",
+        lower,
+    )
+    pick_match = re.search(
+        r"\b(?:pick\s+up|grab|take)\s+(?:the\s+|a\s+|an\s+)?"
+        r"(?P<object>[a-z0-9_\- ]+?)(?:\s+and\s+|\s+then\s+|,|$)",
+        lower,
+    )
+    nav_cn_match = re.search(
+        r"(?:走到|导航到|移动到|去)\s*"
+        r"(?P<target>[\u4e00-\u9fffA-Za-z0-9_\- ]+?)"
+        r"(?=并|然后|再|拿起|抓取|抓|，|,|$)",
+        text,
+    )
+    pick_cn_match = re.search(
+        r"(?:拿起|抓取|抓)\s*"
+        r"(?P<object>[\u4e00-\u9fffA-Za-z0-9_\- ]+?)"
+        r"(?=并|然后|再|，|,|$)",
+        text,
+    )
+
+    if nav_match:
+        target = _strip_rby1_article(nav_match.group("target"))
+        if target:
+            steps.append(("rby1_navigate_to_object", {"target": target}))
+    elif nav_cn_match:
+        target = _strip_rby1_article(nav_cn_match.group("target"))
+        if target:
+            steps.append(("rby1_navigate_to_object", {"target": target}))
+    if pick_match:
+        obj = _strip_rby1_article(pick_match.group("object"))
+        if obj:
+            steps.append(("rby1_pick_object", {"object": obj}))
+    elif pick_cn_match:
+        obj = _strip_rby1_article(pick_cn_match.group("object"))
+        if obj:
+            steps.append(("rby1_pick_object", {"object": obj}))
+
+    if re.fullmatch(r"(?:rby1\s+)?(?:observe|look|scan)", lower) or re.fullmatch(
+        r"(?:rby1\s*)?(?:观察|查看|看一下|扫描)", text
+    ):
+        steps.append(("rby1_observe", {}))
+    if re.fullmatch(r"(?:rby1\s+)?stop", lower) or re.fullmatch(
+        r"(?:rby1\s*)?(?:停止|停下)", text
+    ):
+        steps.append(("rby1_stop", {}))
+    return steps or None
+
+
+def _handle_rby1_agent_text(
+    user_input: str,
+    registry: ToolRegistry,
+    session: Session | None,
+    app_state: dict[str, Any] | None,
+) -> bool:
+    if not (app_state or {}).get("molmospaces_rby1_agent_text"):
+        return False
+    steps = _parse_rby1_agent_text(user_input)
+    if not steps:
+        return False
+
+    context = _build_cli_tool_context(
+        agent=(app_state or {}).get("agent"),
+        session=session,
+        app_state=app_state,
+        engine=(app_state or {}).get("engine"),
+    )
+    total = len(steps)
+    for idx, (skill_name, params) in enumerate(steps, start=1):
+        tool = registry.get(skill_name)
+        if tool is None:
+            console.print(f"[red]  RBY1 skill {skill_name!r} is not registered.[/]")
+            return True
+        console.print(f"[dim]  RBY1 [{idx}/{total}] {skill_name} {params}[/]")
+        result = tool.execute(params, context)
+        if result.is_error:
+            console.print(f"[red]  {result.content}[/]")
+            return True
+        console.print(result.content)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Hardware init
 # ---------------------------------------------------------------------------
@@ -872,6 +1033,13 @@ def enter_scenario(scenario_id: str, app_state: dict[str, Any]) -> Any:
 
 def _init_agent(args: argparse.Namespace) -> Any:
     if not (args.sim or args.sim_go2 or getattr(args, "sim_g1", False)):
+        if bool(getattr(args, "molmospaces_rby1_agent_text", False)):
+            try:
+                from vector_os_nano.core.agent import Agent  # type: ignore[import]
+
+                return Agent(services={"molmospaces_rby1": _rby1_service_config_from_args(args)})
+            except Exception as exc:
+                logger.warning("Could not create MolmoSpaces RBY1 agent: %s", exc)
         return None
     try:
         from vector_os_nano.core.agent import Agent  # type: ignore[import]
@@ -1750,6 +1918,7 @@ def _build_turn_context(
     # resolved world flows into init_vgg(world=...) below, which sets engine._world
     # BEFORE the verifier namespace is built, so the merge picks up its predicates.
     agent = _init_agent(args)
+    _configure_rby1_agent_services(agent, args)
     world = _resolve_active_world(args, agent)
 
     # Tools (categorized registry for scalable tool management)
@@ -1874,6 +2043,7 @@ def _build_turn_context(
             args, "molmospaces_rby1_viewer_camera", "free"
         ),
         "molmospaces_rby1_direct_text": bool(getattr(args, "molmospaces_rby1_direct_text", False)),
+        "molmospaces_rby1_agent_text": bool(getattr(args, "molmospaces_rby1_agent_text", False)),
     }
     app_state["tool_permission_resolver"] = tool_permission_resolver or (
         lambda n, p: ask_permission(n, p)
@@ -2085,6 +2255,7 @@ def main(argv: list[str] | None = None) -> None:
     # resolved world flows into init_vgg(world=...) below, which sets engine._world
     # BEFORE the verifier namespace is built, so the merge picks up its predicates.
     agent = _init_agent(args)
+    _configure_rby1_agent_services(agent, args)
     world = _resolve_active_world(args, agent)
 
     # Tools (categorized registry for scalable tool management)
@@ -2210,6 +2381,7 @@ def main(argv: list[str] | None = None) -> None:
             args, "molmospaces_rby1_viewer_camera", "free"
         ),
         "molmospaces_rby1_direct_text": bool(getattr(args, "molmospaces_rby1_direct_text", False)),
+        "molmospaces_rby1_agent_text": bool(getattr(args, "molmospaces_rby1_agent_text", False)),
     }
 
     # VGG cognitive layer (optional)
@@ -2392,6 +2564,10 @@ def main(argv: list[str] | None = None) -> None:
                         console.print("[yellow]Command timed out (30s)[/]")
                     except Exception as exc:
                         console.print(f"[red]Error:[/] {exc}")
+                continue
+
+            # ---- MolmoSpaces RBY1 structured skill text ----
+            if _handle_rby1_agent_text(user_input, registry, session, app_state):
                 continue
 
             # ---- MolmoSpaces RBY1 direct text ----

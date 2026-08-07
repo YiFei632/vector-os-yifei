@@ -99,7 +99,10 @@ In the `vector-os-nano` environment:
 
 ```bash
 conda activate vector-os-nano
-vector-cli --molmospaces-rby1-host 127.0.0.1 --molmospaces-rby1-port 8765
+vector-cli \
+  --molmospaces-rby1-host 127.0.0.1 \
+  --molmospaces-rby1-port 8765 \
+  --molmospaces-rby1-agent-text
 ```
 
 Then use:
@@ -110,6 +113,17 @@ Then use:
 /rby1 reset kitchen_scene
 /rby1 go to the table and pick up the mug
 ```
+
+With `--molmospaces-rby1-agent-text`, recognized non-slash input is parsed into
+structured RBY1 skills before execution, so this also works:
+
+```text
+go to the table and pick up the mug
+走到桌子并拿起杯子
+```
+
+For bridge debugging, `--molmospaces-rby1-direct-text` is still available. It
+forwards non-slash input as one opaque instruction and bypasses skill planning.
 
 ## Minimal adapter skeleton
 
@@ -173,4 +187,3 @@ def create_adapter(_args=None) -> RBY1InteractiveAdapter:
 This skeleton is enough to wire the protocol end-to-end. Replace the stub
 returns with calls into the real MolmoSpaces env, task sampler, planner, or
 controller stack.
-
