@@ -159,8 +159,10 @@ class Go2VLMPerception:
             self._timeout: float = 45.0  # local: first call loads model (~30s), retry handles it
             logger.info("VLM: local Ollama at %s model=%s", self._base_url, self._model)
         else:
-            api_key: str | None = cfg.get("api_key") or os.environ.get(
-                "OPENROUTER_API_KEY"
+            api_key: str | None = (
+                cfg.get("api_key")
+                or os.environ.get("OPENROUTER_API_KEY")
+                or os.environ.get("DEEPSEEK_API_KEY")
             )
             if not api_key:
                 raise ValueError(
@@ -168,8 +170,18 @@ class Go2VLMPerception:
                     "Pass config={'api_key': '...'} or set OPENROUTER_API_KEY."
                 )
             self._api_key = api_key
-            self._base_url = _OPENROUTER_BASE_URL
-            self._model = _MODEL
+            self._base_url = str(
+                cfg.get("base_url")
+                or os.environ.get("VECTOR_VLM_BASE_URL")
+                or os.environ.get("DEEPSEEK_BASE_URL")
+                or _OPENROUTER_BASE_URL
+            ).rstrip("/")
+            self._model = str(
+                cfg.get("model")
+                or os.environ.get("VECTOR_VLM_MODEL")
+                or os.environ.get("DEEPSEEK_MODEL")
+                or _MODEL
+            )
             self._local = False
             self._timeout: float = _TIMEOUT_S
 

@@ -25,7 +25,7 @@ from vector_os_nano.hardware.sim.g1_mujoco_transport import MuJoCoG1Transport
 
 
 _ROOT = Path(
-    "/media/fishyu/fish-14tb-11/YiFei/unitree_ros/robots/g1_description"
+    "/media/fishyu/fish-14tb-12/YiFei/unitree_ros/robots/g1_description"
 )
 _MJCF = _ROOT / "g1_29dof_with_hand_rev_1_0.xml"
 pytestmark = pytest.mark.skipif(not _MJCF.exists(), reason="local G1 vendor assets absent")

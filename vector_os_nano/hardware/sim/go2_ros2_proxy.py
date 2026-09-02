@@ -12,6 +12,7 @@ import math
 import os
 import time
 import logging
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -32,18 +33,18 @@ def _load_nav_config() -> dict:
     import yaml
 
     _search = [
-        "config/nav.yaml",
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "nav.yaml"),
+        Path("config/nav.yaml"),
+        Path(__file__).resolve().parents[3] / "config" / "nav.yaml",
     ]
     for path in _search:
-        if os.path.exists(path):
+        if path.is_file():
             try:
-                with open(path) as f:
+                with path.open(encoding="utf-8") as f:
                     data = yaml.safe_load(f) or {}
                 _NAV_CFG = data
                 return _NAV_CFG
             except Exception as exc:
-                logger.warning("nav.yaml load failed (%s), using defaults", exc)
+                logger.warning("nav.yaml load failed for %s (%s), using defaults", path, exc)
     _NAV_CFG = {}
     return _NAV_CFG
 
@@ -525,14 +526,22 @@ class Go2ROS2Proxy:
         self._last_waypoint_time = 0.0
 
         # Phase 1: probe FAR — send /goal_point, wait for /way_point response
+        probe_period = 0.5
         probe_deadline = start_time + _FAR_PROBE_S
-        while time.time() < probe_deadline:
+        # Bound the number of publishes as well as wall-clock duration.  This
+        # keeps the 2 Hz contract even when a caller/test replaces sleep with a
+        # no-op; an unbounded time-based loop would otherwise spin and retain
+        # millions of mocked publish calls.
+        max_probe_iterations = max(1, math.ceil(_FAR_PROBE_S / probe_period))
+        for _ in range(max_probe_iterations):
+            if time.time() >= probe_deadline:
+                break
             if not os.path.exists("/tmp/vector_nav_active"):
                 logger.info("[NAV] Cancelled by stop command")
                 self._nav_goal = None
                 return False
             self._publish_goal_point(x, y)
-            time.sleep(0.5)
+            time.sleep(probe_period)
             elapsed = time.time() - start_time
             if self._last_waypoint_time > start_time and elapsed >= _MIN_PROBE_S:
                 logger.info("[NAV] FAR responded with /way_point after %.1fs", elapsed)

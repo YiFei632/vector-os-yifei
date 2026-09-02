@@ -67,7 +67,12 @@ def test_rby1_slash_execute_uses_default_endpoint_and_scene() -> None:
     assert params["port"] == 9999
     assert params["timeout_s"] == 300.0
     assert params["scene_name"] == "lab_room"
-    assert params["context"] == {"viewer": True, "viewer_camera": "free"}
+    assert params["context"] == {
+        "viewer": True, "viewer_camera": "free",
+        "camera_system": "gopro_d455", "navigation_camera": "head_camera",
+        "rectify_gopro": True, "gopro_rectified_vfov": 94.0,
+        "global_map_robot_radius_m": 0.05,
+    }
 
 
 def test_rby1_slash_reset_can_override_scene() -> None:
@@ -122,14 +127,14 @@ def test_rby1_direct_text_routes_plain_input_when_enabled() -> None:
 
 def test_rby1_agent_text_parser_splits_navigation_and_pick() -> None:
     assert _parse_rby1_agent_text("go to the table and pick up the mug") == [
-        ("rby1_navigate_to_object", {"target": "table"}),
+        ("onering_navigation", {"target": "table"}),
         ("rby1_pick_object", {"object": "mug"}),
     ]
 
 
 def test_rby1_agent_text_parser_accepts_chinese_navigation_and_pick() -> None:
     assert _parse_rby1_agent_text("走到桌子并拿起杯子") == [
-        ("rby1_navigate_to_object", {"target": "table"}),
+        ("onering_navigation", {"target": "table"}),
         ("rby1_pick_object", {"object": "mug"}),
     ]
 
@@ -139,7 +144,7 @@ def test_rby1_agent_text_routes_structured_skill_sequence_when_enabled() -> None
     pick_tool = _FakeTool()
     registry = _FakeRegistry(
         {
-            "rby1_navigate_to_object": nav_tool,
+            "onering_navigation": nav_tool,
             "rby1_pick_object": pick_tool,
         }
     )
@@ -161,7 +166,7 @@ def test_rby1_agent_text_routes_structured_skill_sequence_when_enabled() -> None
     assert pick_tool.calls[0]["params"] == {"object": "mug"}
 
 
-def test_rby1_vgg_agent_registers_only_rby1_skills() -> None:
+def test_rby1_vgg_agent_registers_rby1_and_generic_navigation_skills() -> None:
     args = SimpleNamespace(
         sim=False,
         sim_go2=False,
@@ -185,7 +190,9 @@ def test_rby1_vgg_agent_registers_only_rby1_skills() -> None:
         "rby1_observe",
         "rby1_sync_scene",
         "rby1_detect_object",
-        "rby1_navigate_to_object",
+        "onering_navigation",
+        "astar_plan",
+        "grounding_dino_detect",
         "rby1_pick_object",
         "rby1_place_object",
         "rby1_stop",

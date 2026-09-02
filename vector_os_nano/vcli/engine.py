@@ -1197,7 +1197,16 @@ class VectorEngine:
         if skill_name == "navigate" and extracted:
             resolved_room = self._resolve_room_alias(extracted)
             if not resolved_room:
-                return None  # unknown room — let LLM handle
+                # Not a room — try object navigation via onering_navigation.
+                # Strip leading movement verbs: "去冰箱那边" → "冰箱那边"
+                _clean_target = re.sub(
+                    r"^(?:去|走到|导航到|移动到|去到)\s*", "", extracted
+                ).strip()
+                if _clean_target and skill_registry is not None and skill_registry.get("onering_navigation"):
+                    skill_name = "onering_navigation"
+                    extracted = _clean_target
+                else:
+                    return None  # unknown room, no alternative — let LLM handle
 
         # Build verify expression using resolved canonical ID
         verify_arg = resolved_room if resolved_room else extracted
@@ -1243,7 +1252,13 @@ class VectorEngine:
             strategy=f"{skill_name}_skill",
             strategy_params=params,
             timeout_sec=120.0
-            if skill_name in ("navigate", "explore", "patrol", "rby1_navigate_to_object", "rby1_pick_object")
+            if skill_name in (
+                "navigate",
+                "explore",
+                "patrol",
+                "onering_navigation",
+                "rby1_pick_object",
+            )
             else 30.0,
         )
         return GoalTree(goal=user_message, sub_goals=(sub_goal,))

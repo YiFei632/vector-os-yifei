@@ -36,16 +36,11 @@ class _Bridge:
         return {}
 
 
-def test_rby1_perception_detect_falls_back_to_scene_objects_when_rgb_unavailable() -> None:
+def test_rby1_perception_does_not_fallback_to_scene_ground_truth() -> None:
     perception = MolmoSpacesRBY1Perception(bridge=_Bridge())
 
     detections = perception.detect("cup")
-    tracks = perception.track(detections)
-
-    assert len(detections) == 1
-    assert detections[0].label == "mug"
-    assert tracks[0].pose is not None
-    assert tracks[0].pose.x == 1.0
+    assert detections == []
 
 
 def test_sync_scene_to_context_updates_world_model() -> None:

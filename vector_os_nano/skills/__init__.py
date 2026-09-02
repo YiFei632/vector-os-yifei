@@ -11,12 +11,16 @@ from vector_os_nano.skills.handover import HandoverSkill
 from vector_os_nano.skills.home import HomeSkill
 from vector_os_nano.skills.molmospaces_rby1 import (
     RBY1DetectObjectSkill,
-    RBY1NavigateToObjectSkill,
     RBY1ObserveSkill,
     RBY1PickObjectSkill,
     RBY1PlaceObjectSkill,
     RBY1SyncSceneSkill,
     RBY1StopSkill,
+)
+from vector_os_nano.skills.navigation_vln import (
+    AStarPlanSkill,
+    GroundingDINODetectSkill,
+    OneRINGNavigationSkill,
 )
 from vector_os_nano.skills.pick import PickSkill
 from vector_os_nano.skills.place import PlaceSkill
@@ -33,7 +37,9 @@ __all__ = [
     "PickSkill",
     "PlaceSkill",
     "RBY1DetectObjectSkill",
-    "RBY1NavigateToObjectSkill",
+    "AStarPlanSkill",
+    "GroundingDINODetectSkill",
+    "OneRINGNavigationSkill",
     "RBY1ObserveSkill",
     "RBY1PickObjectSkill",
     "RBY1PlaceObjectSkill",
@@ -58,7 +64,9 @@ def get_default_skills() -> list:
         RBY1ObserveSkill(),
         RBY1SyncSceneSkill(),
         RBY1DetectObjectSkill(),
-        RBY1NavigateToObjectSkill(),
+        OneRINGNavigationSkill(),
+        AStarPlanSkill(),
+        GroundingDINODetectSkill(),
         RBY1PickObjectSkill(),
         RBY1PlaceObjectSkill(),
         RBY1StopSkill(),

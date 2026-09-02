@@ -572,6 +572,7 @@ class TestIsaacSimProxyNavigation:
 
         # Mock: robot arrives immediately
         proxy.get_position = MagicMock(return_value=(0.5, 0.5, 0.28))
+        proxy._publish_goal_point = MagicMock()
 
         # FAR responds immediately (waypoint received)
         proxy._last_waypoint_time = time.time() + 100  # already received
@@ -584,7 +585,10 @@ class TestIsaacSimProxyNavigation:
             except Exception:
                 result = None  # navigation may fail without full stack
 
-        proxy._goal_pub.publish.assert_called()
+        proxy._publish_goal_point.assert_called()
+        # A mocked/no-op sleep must not turn the wall-clock probe into an
+        # unbounded busy loop that retains millions of MagicMock calls.
+        assert proxy._publish_goal_point.call_count <= 6
 
     def test_navigate_to_returns_true_on_arrival(self) -> None:
         proxy = self._nav_proxy()

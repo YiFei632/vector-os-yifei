@@ -111,7 +111,16 @@ class StrategySelector:
         """
         # Priority 1: Explicit strategy from GoalTree
         if sub_goal.strategy:
-            return self._resolve_explicit(sub_goal.strategy, sub_goal.strategy_params)
+            params = dict(sub_goal.strategy_params or {})
+            valid = self._registered_skill_names() or frozenset()
+            if sub_goal.strategy == "navigate_skill" and "navigate" not in valid and "onering_navigation" in valid:
+                target = params.get("target") or params.get("room") or sub_goal.description
+                return StrategyResult("skill", "onering_navigation", {"target": target})
+            if sub_goal.strategy == "onering_navigation_skill" and not any(
+                params.get(key) for key in ("target", "instruction", "query", "room")
+            ):
+                params["target"] = sub_goal.description
+            return self._resolve_explicit(sub_goal.strategy, params)
 
         # Priority 1b (fail-loud, rule 8): a step whose explicit strategy was a
         # HALLUCINATION carries the offending name on ``cleared_strategy`` (the
@@ -126,6 +135,9 @@ class StrategySelector:
         cleared = getattr(sub_goal, "cleared_strategy", "")
         if cleared:
             valid = self._registered_skill_names()
+            if cleared == "navigate_skill" and valid and "onering_navigation" in valid:
+                target = sub_goal.strategy_params.get("target") or sub_goal.strategy_params.get("room") or sub_goal.description
+                return StrategyResult("skill", "onering_navigation", {"target": target})
             return StrategyResult(
                 "invalid",
                 cleared,
@@ -151,8 +163,17 @@ class StrategySelector:
         if self._has_base:
             # Navigation
             if any(kw in combined for kw in ("reach", "navigate", "go_to", "到", "去")):
-                room = sub_goal.strategy_params.get("room", sub_goal.description)
-                result = self._route("navigate", {"room": room})
+                valid = self._registered_skill_names() or frozenset()
+                if "onering_navigation" in valid and "navigate" not in valid:
+                    target = (
+                        sub_goal.strategy_params.get("target")
+                        or sub_goal.strategy_params.get("room")
+                        or sub_goal.description
+                    )
+                    result = self._route("onering_navigation", {"target": target})
+                else:
+                    room = sub_goal.strategy_params.get("room", sub_goal.description)
+                    result = self._route("navigate", {"room": room})
 
             # Observation
             elif any(kw in combined for kw in ("observe", "look", "scan", "看", "观察")):
@@ -189,7 +210,11 @@ class StrategySelector:
         if result is None and self._skill_registry is not None:
             match = self._skill_registry.match(sub_goal.description)
             if match is not None:
-                result = StrategyResult("skill", match.skill_name, {})
+                params = {}
+                skill = self._skill_registry.get(match.skill_name)
+                if "target" in getattr(skill, "parameters", {}) and match.extracted_arg:
+                    params["target"] = match.extracted_arg
+                result = StrategyResult("skill", match.skill_name, params)
 
         # Priority 4: Fallback
         if result is None:

@@ -25,7 +25,7 @@
 当前开发机使用的模型资产是：
 
 ```text
-/media/fishyu/fish-14tb-11/YiFei/unitree_ros/robots/g1_description/
+/media/fishyu/fish-14tb-12/YiFei/unitree_ros/robots/g1_description/
 ├── g1_29dof_with_hand_rev_1_0.urdf
 ├── g1_29dof_with_hand_rev_1_0.xml
 └── meshes/

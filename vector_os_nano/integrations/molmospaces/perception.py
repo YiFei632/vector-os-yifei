@@ -125,9 +125,8 @@ def sync_scene_to_context(context: Any, objects: list[dict[str, Any]]) -> dict[s
 class MolmoSpacesRBY1Perception:
     """Perception backend backed by the MolmoSpaces RBY1 bridge.
 
-    RGB frames are used with Grounding-DINO when available. If offscreen rendering
-    is unavailable because a GUI viewer owns the GL context, detection falls back to
-    MolmoSpaces ground-truth scene objects.
+    RGB frames are used with Grounding-DINO. Ground-truth scene objects are never
+    used as a perception fallback.
     """
 
     def __init__(
@@ -155,8 +154,10 @@ class MolmoSpacesRBY1Perception:
         return list(self._last_objects)
 
     def sync_scene(self, context: Any) -> dict[str, Any]:
-        objects = self.list_scene_objects()
-        return sync_scene_to_context(context, objects)
+        del context
+        raise RuntimeError(
+            "Ground-truth MolmoSpaces scene synchronization is disabled for visual navigation"
+        )
 
     def get_color_frame(self) -> np.ndarray:
         result = self._bridge.execute(
@@ -189,18 +190,12 @@ class MolmoSpacesRBY1Perception:
 
     def caption(self, length: str = "normal") -> str:
         del length
-        objects = self.list_scene_objects()
-        labels = [str(o.get("label") or o.get("category") or o.get("name")) for o in objects[:12]]
-        return "MolmoSpaces scene with: " + ", ".join(labels)
+        frame = self.get_color_frame()
+        return f"MolmoSpaces RGB observation {frame.shape[1]}x{frame.shape[0]}"
 
     def visual_query(self, question: str) -> str:
-        objects = self.list_scene_objects()
-        matches = [o for o in objects if _object_matches(question, o)]
-        if matches:
-            return f"Found {len(matches)} matching object(s): " + ", ".join(
-                str(o.get("label") or o.get("name")) for o in matches[:10]
-            )
-        return "No matching MolmoSpaces object found."
+        detections = self.detect(question)
+        return f"Found {len(detections)} visual detection(s) for {question!r}."
 
     def detect(self, query: str) -> list[Detection]:
         try:
@@ -211,44 +206,19 @@ class MolmoSpacesRBY1Perception:
             if detections:
                 return detections
         except Exception:
-            pass
-
-        objects = self.list_scene_objects()
-        matches = [obj for obj in objects if _object_matches(query, obj)]
-        detections: list[Detection] = []
-        for idx, obj in enumerate(matches):
-            # Ground-truth fallback has no pixel box. Return a stable dummy box so
-            # downstream code sees a detection and can recover 3D pose via track().
-            x1 = 10.0 + idx * 5.0
-            detections.append(
-                Detection(
-                    label=str(obj.get("label") or obj.get("category") or obj.get("name")),
-                    bbox=(x1, 10.0, x1 + 1.0, 11.0),
-                    confidence=float(obj.get("confidence", 1.0)),
-                )
-            )
-        return detections
+            return []
+        return []
 
     def track(self, detections: list[Detection]) -> list[TrackedObject]:
-        if not self._last_objects:
-            self._last_objects = self.list_scene_objects()
         tracked: list[TrackedObject] = []
         for idx, det in enumerate(detections):
-            match = next((obj for obj in self._last_objects if _object_matches(det.label, obj)), None)
-            pose = None
-            bbox_3d = None
-            if match is not None and isinstance(match.get("position"), list):
-                pos = match["position"]
-                if len(pos) >= 3:
-                    pose = Pose3D(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
-                    bbox_3d = BBox3D(center=pose, size_x=0.05, size_y=0.05, size_z=0.05)
             tracked.append(
                 TrackedObject(
                     track_id=idx,
                     label=det.label,
                     bbox_2d=det.bbox,
-                    pose=pose,
-                    bbox_3d=bbox_3d,
+                    pose=None,
+                    bbox_3d=None,
                     confidence=det.confidence,
                 )
             )

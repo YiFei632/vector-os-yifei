@@ -475,7 +475,7 @@ def test_pinocchio_fk_and_position_ik_against_supplied_rev_1_0_assets() -> None:
     if importlib.util.find_spec("pinocchio") is None:
         pytest.skip("optional Pinocchio dependency is not installed")
     root = Path(
-        "/media/fishyu/fish-14tb-11/YiFei/unitree_ros/robots/g1_description"
+        "/media/fishyu/fish-14tb-12/YiFei/unitree_ros/robots/g1_description"
     )
     urdf = root / "g1_29dof_with_hand_rev_1_0.urdf"
     if not urdf.is_file():

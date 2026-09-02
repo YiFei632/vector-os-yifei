@@ -32,12 +32,10 @@ You can load it with:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import importlib
 import json
 import logging
 import socketserver
-import threading
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
@@ -69,32 +67,12 @@ class MolmoSpacesRBY1Adapter(Protocol):
     def stop(self) -> dict[str, Any]: ...
 
 class BridgeDispatcher:
-    """Protocol router, independent of the transport layer.
-
-    MolmoSpaces/MuJoCo keeps an EGL context inside the task renderer. The TCP
-    server is threaded, so requests from different clients would otherwise call
-    into the same adapter from different handler threads. Pinning all adapter
-    calls to one persistent worker keeps EGL ownership stable across observe,
-    reset, and execute requests.
-    """
+    """Protocol router, independent of the transport layer."""
 
     def __init__(self, adapter: MolmoSpacesRBY1Adapter) -> None:
         self._adapter = adapter
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="molmospaces-egl-owner",
-        )
-        self._close_lock = threading.Lock()
-        self._closed = False
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
-        with self._close_lock:
-            if self._closed:
-                raise RuntimeError("bridge dispatcher is closed")
-            future = self._executor.submit(self._handle_on_owner_thread, request)
-        return future.result()
-
-    def _handle_on_owner_thread(self, request: dict[str, Any]) -> dict[str, Any]:
         msg_type = str(request.get("type", "")).strip()
         if msg_type == "handshake":
             metadata = self._adapter.connect()

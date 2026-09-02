@@ -68,6 +68,7 @@ def _rby1_config(context: SkillContext) -> dict[str, Any]:
             or 300.0
         ),
     }
+    config.setdefault("online", {})
     return config
 
 
@@ -108,6 +109,12 @@ def _bridge_error(exc: Exception) -> SkillResult:
     )
 
 
+def _objects_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract JSON scene objects returned by the MolmoSpaces bridge."""
+    values = result.get("objects", []) if isinstance(result, dict) else []
+    return [dict(value) for value in values if isinstance(value, dict)]
+
+
 def _supported_bridge_items(metadata: dict[str, Any]) -> set[str]:
     supported: set[str] = set()
     for key in ("supported_actions", "supported_task_types", "capabilities"):
@@ -115,17 +122,6 @@ def _supported_bridge_items(metadata: dict[str, Any]) -> set[str]:
         if isinstance(values, list):
             supported.update(str(item).lower() for item in values)
     return supported
-
-
-def _list_scene_objects(bridge: MolmoSpacesRBY1Bridge, config: dict[str, Any]) -> list[dict[str, Any]]:
-    result = bridge.execute(
-        "list scene objects",
-        context={**_runtime_context(config), "structured_action": "list_scene_objects"},
-        mode="structured",
-        timeout_s=float(config["endpoint"]["timeout_s"]),
-    )
-    objects = result.get("objects", [])
-    return [dict(obj) for obj in objects if isinstance(obj, dict)]
 
 
 def _object_matches(query: str, obj: dict[str, Any]) -> bool:
@@ -147,6 +143,8 @@ def _object_matches(query: str, obj: dict[str, Any]) -> bool:
     return False
 
 
+
+
 @skill(
     aliases=["rby1 observe", "observe rby1", "观察rby1", "查看rby1"],
     direct=False,
@@ -165,12 +163,6 @@ class RBY1ObserveSkill:
         try:
             bridge, config = _bridge_for_context(context)
             state = bridge.observe()
-            try:
-                objects = _list_scene_objects(bridge, config)
-                state["objects"] = objects
-                state["scene_sync"] = sync_scene_to_context(context, objects)
-            except Exception as exc:  # noqa: BLE001
-                state["scene_sync_error"] = f"{type(exc).__name__}: {exc}"
             return SkillResult(success=True, result_data=state)
         except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
             return _bridge_error(exc)
@@ -187,15 +179,34 @@ class RBY1SyncSceneSkill:
     preconditions: list[str] = ["MolmoSpaces RBY1 bridge server is running"]
     postconditions: list[str] = ["MolmoSpaces scene objects are available in Vector world state"]
     effects: dict[str, Any] = {}
-    failure_modes: list[str] = ["molmospaces_rby1_bridge_error"]
+    failure_modes: list[str] = ["molmospaces_rby1_bridge_error", "scene_sync_empty"]
 
     def execute(self, params: dict, context: SkillContext) -> SkillResult:
         del params
         try:
             bridge, config = _bridge_for_context(context)
-            objects = _list_scene_objects(bridge, config)
-            sync = sync_scene_to_context(context, objects)
-            return SkillResult(success=True, result_data={"objects": objects, "scene_sync": sync})
+            result = bridge.execute(
+                "synchronize MolmoSpaces scene",
+                context={
+                    **_runtime_context(config),
+                    "structured_action": "list_scene_objects",
+                },
+                mode="structured",
+                timeout_s=config["endpoint"]["timeout_s"],
+            )
+            objects = _objects_from_result(result)
+            synced = sync_scene_to_context(context, objects)
+            if not objects:
+                return SkillResult(
+                    success=False,
+                    result_data={"objects": [], **synced},
+                    error_message="MolmoSpaces returned no scene objects.",
+                    diagnosis_code="scene_sync_empty",
+                )
+            return SkillResult(
+                success=True,
+                result_data={"objects": objects, **synced},
+            )
         except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
             return _bridge_error(exc)
 
@@ -228,96 +239,16 @@ class RBY1DetectObjectSkill:
             )
         try:
             bridge, config = _bridge_for_context(context)
-            objects = _list_scene_objects(bridge, config)
-            sync = sync_scene_to_context(context, objects)
-            matches = [obj for obj in objects if _object_matches(query, obj)]
-            if not matches:
+            perception = context.perception
+            if perception is None or not callable(getattr(perception, "detect", None)):
                 return SkillResult(
                     success=False,
-                    result_data={"objects": objects, "scene_sync": sync, "query": query},
-                    error_message=f"No MolmoSpaces objects matched {query!r}",
-                    diagnosis_code="no_detections",
+                    error_message="Visual perception is unavailable.", diagnosis_code="no_perception",
                 )
-            return SkillResult(
-                success=True,
-                result_data={"detections": matches, "objects": objects, "scene_sync": sync},
-            )
+            detections = perception.detect(query)
+            return SkillResult(success=bool(detections), result_data={"detections": [d.to_dict() if hasattr(d, "to_dict") else str(d) for d in detections]}, error_message="No visual detections" if not detections else "", diagnosis_code="no_detections" if not detections else "")
         except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
             return _bridge_error(exc)
-
-
-@skill(
-    aliases=[
-        "rby1 navigate",
-        "rby1 go to",
-        "navigate rby1",
-        "rby1 走到",
-        "rby1 导航到",
-    ],
-    direct=False,
-)
-class RBY1NavigateToObjectSkill:
-    name = "rby1_navigate_to_object"
-    description = "Navigate the MolmoSpaces RBY1 robot to an object or fixture in the active scene."
-    typical_duration_sec = 120.0
-    parameters: dict[str, Any] = {
-        "target": {
-            "type": "string",
-            "description": "Object or fixture category to navigate to, such as table, mug, chair, or refrigerator.",
-        }
-    }
-    preconditions: list[str] = ["MolmoSpaces RBY1 bridge server is running"]
-    postconditions: list[str] = ["RBY1 is near the requested object when the nav task succeeds"]
-    effects: dict[str, Any] = {"base": "move", "navigate": True}
-    failure_modes: list[str] = ["missing_target", "navigation_failed", "molmospaces_rby1_bridge_error"]
-
-    def execute(self, params: dict, context: SkillContext) -> SkillResult:
-        target = _normalize_target(
-            params.get("target")
-            or params.get("object")
-            or params.get("destination")
-            or params.get("query")
-        )
-        if not target:
-            return SkillResult(
-                success=False,
-                error_message="Missing RBY1 navigation target",
-                diagnosis_code="missing_target",
-            )
-
-        try:
-            bridge, config = _bridge_for_context(context)
-            runtime_context = _runtime_context(config)
-            runtime_context.update(
-                {
-                    "structured_action": "navigate_to_object",
-                    "target": target,
-                    "target_types": [target],
-                    "allow_execute_reset": False,
-                }
-            )
-            result = bridge.execute(
-                f"go to the {target}",
-                context=runtime_context,
-                mode="structured",
-                timeout_s=float(config["endpoint"]["timeout_s"]),
-            )
-        except (MolmoSpacesRBY1Error, TimeoutError, OSError) as exc:
-            return _bridge_error(exc)
-
-        terminal_reason = str(result.get("terminal_reason", ""))
-        success = bool(result.get("success")) or terminal_reason == "task_done"
-        if not success:
-            return SkillResult(
-                success=False,
-                result_data=result,
-                error_message=(
-                    f"RBY1 navigation to {target!r} did not complete "
-                    f"(terminal_reason={terminal_reason or 'unknown'})"
-                ),
-                diagnosis_code="navigation_failed",
-            )
-        return SkillResult(success=True, result_data=result)
 
 
 @skill(
@@ -485,7 +416,6 @@ class RBY1StopSkill:
 
 __all__ = [
     "RBY1DetectObjectSkill",
-    "RBY1NavigateToObjectSkill",
     "RBY1ObserveSkill",
     "RBY1PickObjectSkill",
     "RBY1PlaceObjectSkill",

@@ -1,5 +1,8 @@
 # MolmoSpaces RBY1 bridge server
 
+For the OneRING + local A* navigation process and launch commands, see
+[RBY1_ONERING_NAVIGATION.md](RBY1_ONERING_NAVIGATION.md).
+
 This document describes the remaining MolmoSpaces-side piece for the
 vector-os-nano ↔ MolmoSpaces RBY1 integration.
 
@@ -24,7 +27,7 @@ Use the assets cache path you already have:
 ```bash
 conda activate mlspaces
 export MLSPACES_CACHE_DIR=~/.cache/molmo-spaces-resources
-export MLSPACES_ASSETS_DIR=/media/fishyu/fish-14tb-11/YiFei/molmospaces/molmo-spaces-resources
+export MLSPACES_ASSETS_DIR=/media/fishyu/fish-14tb-12/YiFei/molmospaces/molmo-spaces-resources
 ```
 
 If the cache needs to be materialized or refreshed:
@@ -85,7 +88,7 @@ After creating the adapter, start the bridge in `mlspaces`:
 ```bash
 conda activate mlspaces
 export MLSPACES_CACHE_DIR=~/.cache/molmo-spaces-resources
-export MLSPACES_ASSETS_DIR=/media/fishyu/fish-14tb-11/YiFei/molmospaces/molmo-spaces-resources
+export MLSPACES_ASSETS_DIR=/media/fishyu/fish-14tb-12/YiFei/molmospaces/molmo-spaces-resources
 
 python scripts/molmospaces_rby1_bridge_server.py \
   --adapter molmo_spaces.bridge.rby1_interactive_adapter:create_adapter \
@@ -137,7 +140,9 @@ The RBY1-VGG embodiment exposes these structured skills:
 rby1_observe
 rby1_sync_scene
 rby1_detect_object
-rby1_navigate_to_object
+onering_navigation
+astar_plan
+grounding_dino_detect
 rby1_pick_object
 rby1_place_object
 rby1_stop
@@ -145,19 +150,32 @@ rby1_stop
 
 `rby1_observe` and `rby1_sync_scene` synchronize MolmoSpaces scene objects into
 Vector's world model / scene graph. `rby1_detect_object` uses the bridge-backed
-perception source: it tries MolmoSpaces RGB + Grounding-DINO when RGB rendering
-is available, and falls back to MolmoSpaces ground-truth scene objects when the
-GUI viewer owns the GL context.
+perception source. `onering_navigation`, `astar_plan`, and
+`grounding_dino_detect` are generic Vector tools rather than RBY1-only actions;
+Go2 and future RGB-D mobile robots discover the same tools at startup.
+
+The GUI viewer is process-isolated (GLFW) from the MolmoSpaces EGL offscreen
+renderer, so `observe_rgbd` remains available while the viewer is open.
 
 The current reference adapter advertises navigation, RGB observation, and scene
 object state. Pick/place skills are present as structured VGG actions, but they
 return an honest `manipulation_unsupported` result until a CuRobo-backed
 MolmoSpaces manipulation adapter advertises `pick_object` / `place_object`.
 
-For an already loaded scene, structured navigation retargets the active
-`nav_to_obj` task in place and replans A*. It does not resample or reload the
-MuJoCo scene when the user changes targets, so consecutive commands such as
-`go to the table` and `go to the refrigerator` keep the same scene instance.
+For an already loaded scene, generic navigation keeps the same MuJoCo scene,
+observes RGB-D, updates the semantic topology map, and executes OneRING discrete
+actions or local A* waypoints.
+
+Bridge reset 只加载场景、机器人和相机，并进入无目标待命状态。sampler 为创建
+`NavToObjTask` 临时选择的对象会在 reset 后立即清空；内置 MolmoSpaces A* policy
+不会被创建、预热或执行。此时 state 中的 `task_description` 为
+`Waiting for Vector navigation target`，`external_navigation_target` 为 `null`。
+
+The online controller also uses two structured bridge actions internally:
+`prepare_navigation` retargets the active `nav_to_obj` task to the user's
+language target without reloading the scene, and `navigation_status` returns a
+distance-grounded arrival verdict. A OneRING `done` action is never accepted as
+success without this verdict.
 
 ## Minimal adapter skeleton
 

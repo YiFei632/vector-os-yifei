@@ -73,7 +73,7 @@ def create_backend(
     """Factory: create the right backend for a given provider.
 
     Args:
-        provider: "anthropic" or "openrouter" or "openai_compat".
+        provider: "anthropic", "openrouter", "openai", or "openai_compat".
         api_key:  API key for the provider.
         model:    Model identifier (provider-specific naming).
         base_url: Optional base URL override.
@@ -85,6 +85,17 @@ def create_backend(
         from vector_os_nano.vcli.backends.anthropic import AnthropicBackend
 
         return AnthropicBackend(api_key=api_key, model=model, base_url=base_url)
+
+    if provider in {"openai_responses", "responses", "codex"}:
+        from vector_os_nano.vcli.backends.openai_responses import OpenAIResponsesBackend
+
+        return OpenAIResponsesBackend(
+            api_key=api_key,
+            model=model,
+            base_url=base_url or "https://api.openai.com/v1",
+        )
+    if provider == "openai":
+        provider = "openai_compat"
 
     # openrouter, openai_compat, local — all use OpenAI-compatible API
     from vector_os_nano.vcli.backends.openai_compat import OpenAICompatBackend

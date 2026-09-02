@@ -729,6 +729,19 @@ def _rby1_base_params(args_rest: list[str], app_state: dict[str, Any] | None) ->
         viewer_camera = app_state.get("molmospaces_rby1_viewer_camera")
         if viewer_camera:
             viewer_context["viewer_camera"] = viewer_camera
+    runtime_context = params.setdefault("context", {})
+    runtime_context["camera_system"] = str(
+        app_state.get("molmospaces_rby1_camera_system")
+        or os.environ.get("RBY1_CAMERA_SYSTEM", "gopro_d455")
+    )
+    runtime_context["navigation_camera"] = "head_camera"
+    runtime_context["rectify_gopro"] = True
+    runtime_context["gopro_rectified_vfov"] = float(
+        os.environ.get("RBY1_GOPRO_RECTIFIED_VFOV", "94.0")
+    )
+    runtime_context["global_map_robot_radius_m"] = float(
+        os.environ.get("RBY1_ASTAR_ROBOT_RADIUS", "0.05")
+    )
     return params
 
 
@@ -795,7 +808,17 @@ def _handle_rby1_direct_text(
 
 
 def _rby1_service_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    runtime_context: dict[str, Any] = {}
+    runtime_context: dict[str, Any] = {
+        "camera_system": os.environ.get("RBY1_CAMERA_SYSTEM", "gopro_d455"),
+        "navigation_camera": "head_camera",
+        "rectify_gopro": True,
+        "gopro_rectified_vfov": float(
+            os.environ.get("RBY1_GOPRO_RECTIFIED_VFOV", "94.0")
+        ),
+        "global_map_robot_radius_m": float(
+            os.environ.get("RBY1_ASTAR_ROBOT_RADIUS", "0.05")
+        ),
+    }
     if bool(getattr(args, "molmospaces_rby1_viewer", False)):
         runtime_context["viewer"] = True
         viewer_camera = getattr(args, "molmospaces_rby1_viewer_camera", "free")
@@ -809,6 +832,43 @@ def _rby1_service_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         },
         "scene_name": getattr(args, "molmospaces_rby1_scene", None),
         "context": runtime_context,
+        "onering": {
+            "endpoint": os.environ.get("ONERING_URL", "http://127.0.0.1:7801"),
+            "timeout_s": float(os.environ.get("ONERING_TIMEOUT", "60")),
+            "enabled": os.environ.get("ONERING_ENABLED", "1").strip().lower()
+            not in {"0", "false", "no", "off"},
+        },
+        "online": {
+            "max_steps": int(os.environ.get("RBY1_VLN_MAX_STEPS", "100")),
+            "waypoint_index": int(os.environ.get("RBY1_VLN_WAYPOINT_INDEX", "3")),
+            "control_steps": int(os.environ.get("RBY1_VLN_CONTROL_STEPS", "3")),
+            "goal_tolerance_m": float(os.environ.get("RBY1_VLN_GOAL_TOLERANCE", "2.0")),
+            "camera": os.environ.get("RBY1_VLN_CAMERA", "head_camera"),
+            "waypoint_tolerance_m": float(os.environ.get("RBY1_VLN_WAYPOINT_TOLERANCE", "0.16")),
+            "lookahead_distance_m": float(os.environ.get("RBY1_VLN_LOOKAHEAD_DISTANCE", "0.35")),
+            "max_command_distance_m": float(os.environ.get("RBY1_VLN_MAX_COMMAND_DISTANCE", "0.45")),
+            "max_yaw_step_rad": float(os.environ.get("RBY1_VLN_MAX_YAW_STEP", "0.35")),
+            "target_filter_alpha": float(os.environ.get("RBY1_VLN_TARGET_FILTER_ALPHA", "0.45")),
+            "smoothing_window": int(os.environ.get("RBY1_VLN_SMOOTHING_WINDOW", "3")),
+            "replan_interval_steps": int(os.environ.get("RBY1_VLN_REPLAN_INTERVAL", "3")),
+            "progress_window_steps": int(os.environ.get("RBY1_VLN_PROGRESS_WINDOW", "10")),
+            "min_progress_m": float(os.environ.get("RBY1_VLN_MIN_PROGRESS", "0.04")),
+            "max_unstable_replans": int(os.environ.get("RBY1_VLN_MAX_UNSTABLE_REPLANS", "2")),
+            "unknown_policy": os.environ.get("VECTOR_UNKNOWN_NAV_POLICY", "onering"),
+            "onering_control_steps": int(os.environ.get("ONERING_CONTROL_STEPS", "1")),
+            "onering_fallback_policy": os.environ.get("ONERING_FALLBACK_POLICY", "astar"),
+            "max_result_history": int(os.environ.get("RBY1_VLN_MAX_RESULT_HISTORY", "256")),
+        },
+        "grounding_dino": {
+            "repository": os.environ.get(
+                "GROUNDING_DINO_REPO",
+                "/media/fishyu/fish-14tb-12/YiFei/GroundingDINO",
+            ),
+            "checkpoint": os.environ.get(
+                "GROUNDING_DINO_CHECKPOINT",
+                "/media/fishyu/fish-14tb-12/YiFei/GroundingDINO/checkpoints/groundingdino_swint_ogc.pth",
+            ),
+        },
     }
 
 
@@ -818,7 +878,42 @@ def _configure_rby1_agent_services(agent: Any, args: argparse.Namespace) -> None
     services = getattr(agent, "_services", None)
     if not isinstance(services, dict):
         return
-    services["molmospaces_rby1"] = _rby1_service_config_from_args(args)
+    rby1_config = _rby1_service_config_from_args(args)
+    services["molmospaces_rby1"] = rby1_config
+    # Navigation model/planner settings are robot-independent.  Keeping them
+    # under the generic service lets the same startup-discovered tools run on
+    # RBY1 today and Go2/other RGB-D bases without a second skill definition.
+    services["navigation"] = {
+        key: rby1_config[key]
+        for key in ("onering", "online", "grounding_dino")
+        if key in rby1_config
+    }
+    services["navigation"]["planner"] = {
+        "primary": "astar",
+        "fallback": None,
+    }
+    # The simulator bridge is also the RBY1 robot-layer transport in this
+    # deployment. Expose it as a base so navigation emits walk/stop commands
+    # instead of calling the MolmoSpaces policy/waypoint path directly.
+    try:
+        from vector_os_nano.core.skill import SkillContext
+        from vector_os_nano.integrations.molmospaces import MolmoSpacesRBY1Base, ROS2RBY1Base
+        from vector_os_nano.skills.molmospaces_rby1 import _bridge_for_context
+        bridge, _ = _bridge_for_context(SkillContext(services=services))
+        use_ros2 = os.environ.get("RBY1_ROS2_TRANSPORT", "1").strip().lower() not in {"0", "false", "no", "off"}
+        try:
+            base = ROS2RBY1Base() if use_ros2 else MolmoSpacesRBY1Base(bridge)
+        except Exception as exc:
+            if use_ros2:
+                logger.warning("RBY1 ROS2 base unavailable, using TCP simulation base: %s", exc)
+            base = MolmoSpacesRBY1Base(bridge)
+        agent._bases[base.name] = base
+        agent._base = base
+        agent._default_base_name = base.name
+        services["rby1_base"] = base
+        logger.info("RBY1 Vector robot layer enabled: %s", base.name)
+    except Exception as exc:
+        logger.warning("Could not enable RBY1 Vector robot layer: %s", exc)
 
 
 def _configure_rby1_vgg_agent(agent: Any, args: argparse.Namespace) -> None:
@@ -827,12 +922,16 @@ def _configure_rby1_vgg_agent(agent: Any, args: argparse.Namespace) -> None:
     from vector_os_nano.core.skill import SkillRegistry
     from vector_os_nano.skills.molmospaces_rby1 import (
         RBY1DetectObjectSkill,
-        RBY1NavigateToObjectSkill,
         RBY1ObserveSkill,
         RBY1PickObjectSkill,
         RBY1PlaceObjectSkill,
         RBY1SyncSceneSkill,
         RBY1StopSkill,
+    )
+    from vector_os_nano.skills.navigation_vln import (
+        AStarPlanSkill,
+        GroundingDINODetectSkill,
+        OneRINGNavigationSkill,
     )
 
     registry = SkillRegistry()
@@ -840,7 +939,9 @@ def _configure_rby1_vgg_agent(agent: Any, args: argparse.Namespace) -> None:
         RBY1ObserveSkill(),
         RBY1SyncSceneSkill(),
         RBY1DetectObjectSkill(),
-        RBY1NavigateToObjectSkill(),
+        OneRINGNavigationSkill(),
+        AStarPlanSkill(),
+        GroundingDINODetectSkill(),
         RBY1PickObjectSkill(),
         RBY1PlaceObjectSkill(),
         RBY1StopSkill(),
@@ -850,7 +951,77 @@ def _configure_rby1_vgg_agent(agent: Any, args: argparse.Namespace) -> None:
     agent._molmospaces_rby1_vgg = True
     from vector_os_nano.integrations.molmospaces.perception import MolmoSpacesRBY1Perception
 
-    agent._perception = MolmoSpacesRBY1Perception(_rby1_service_config_from_args(args))
+    rby1_config = _rby1_service_config_from_args(args)
+    agent._perception = MolmoSpacesRBY1Perception(rby1_config)
+    if getattr(agent, "_base", None) is None and not getattr(agent, "_services", {}).get("rby1_base"):
+        logger.warning(
+            "RBY1 navigation has no Vector robot-layer base; commands will not control a physical RBY1. "
+            "Inject services['rby1_base'] (walk/stop) or construct Agent(base=...)."
+        )
+
+    # Fail fast at startup instead of waiting for the first navigation skill.
+    # This makes a missing/stale MolmoSpaces bridge visible in the launch log
+    # and avoids reporting a seemingly successful Vector startup with no
+    # external runtime connected.
+    try:
+        from vector_os_nano.core.skill import SkillContext
+        from vector_os_nano.skills.molmospaces_rby1 import _bridge_for_context
+
+        bridge, _ = _bridge_for_context(SkillContext(services={"molmospaces_rby1": rby1_config}))
+        metadata = bridge.connect()
+        logger.info(
+            "MolmoSpaces RBY1 bridge connected at %s:%s (robot=%s)",
+            rby1_config["endpoint"]["host"], rby1_config["endpoint"]["port"],
+            metadata.get("robot", "unknown") if isinstance(metadata, dict) else "unknown",
+        )
+    except Exception as exc:  # keep CLI usable for non-bridge commands
+        logger.error(
+            "MolmoSpaces RBY1 bridge unavailable at %s:%s: %s",
+            rby1_config["endpoint"]["host"], rby1_config["endpoint"]["port"], exc,
+        )
+
+    # RBY1's online mapper writes the same semantic-topology format used by the
+    # rest of Vector.  Do not overwrite a graph injected by a caller/test.
+    if getattr(agent, "_spatial_memory", None) is None:
+        from vector_os_nano.core.scene_graph import SceneGraph
+
+        scene_name = getattr(args, "molmospaces_rby1_scene", None) or "default"
+        safe_scene = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(scene_name))
+        graph_path = Path.home() / ".vector_os_nano" / "molmospaces" / f"{safe_scene}.visual.yaml"
+        try:
+            graph_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Restricted/containerized runs may not expose a writable home.
+            graph_path = Path("/tmp/vector_os_nano/molmospaces") / f"{safe_scene}.visual.yaml"
+            graph_path.parent.mkdir(parents=True, exist_ok=True)
+        graph = SceneGraph(persist_path=str(graph_path))
+        # Do not preload MolmoSpaces ground-truth object coordinates into a
+        # visual navigation session. A fresh graph forces OneRING to receive
+        # the first RGB observation before any target can be grounded.
+        if os.environ.get("VECTOR_LOAD_PERSISTED_VISUAL_MAP", "0").lower() in {"1", "true", "yes"}:
+            graph.load()
+        agent._spatial_memory = graph
+
+    # The configured LLM may be text-only today.  The mapper catches image
+    # request failures and continues with detector/room-map degradation until a
+    # VLM model is selected in .env.
+    vlm_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    if vlm_key and getattr(agent, "_vlm", None) is None:
+        try:
+            from vector_os_nano.perception.vlm_go2 import Go2VLMPerception
+
+            agent._vlm = Go2VLMPerception(
+                config={
+                    "api_key": vlm_key,
+                    "model": os.environ.get("VECTOR_VLM_MODEL")
+                    or os.environ.get("DEEPSEEK_MODEL"),
+                    "base_url": os.environ.get("VECTOR_VLM_BASE_URL")
+                    or os.environ.get("DEEPSEEK_BASE_URL"),
+                }
+            )
+        except Exception as exc:
+            logger.warning("RBY1 VLM unavailable; semantic map will degrade: %s", exc)
+            agent._vlm = None
 
 
 def _strip_rby1_article(value: str) -> str:
@@ -924,11 +1095,11 @@ def _parse_rby1_agent_text(user_input: str) -> list[tuple[str, dict[str, Any]]] 
     if nav_match:
         target = _strip_rby1_article(nav_match.group("target"))
         if target:
-            steps.append(("rby1_navigate_to_object", {"target": target}))
+            steps.append(("onering_navigation", {"target": target}))
     elif nav_cn_match:
         target = _strip_rby1_article(nav_cn_match.group("target"))
         if target:
-            steps.append(("rby1_navigate_to_object", {"target": target}))
+            steps.append(("onering_navigation", {"target": target}))
     if pick_match:
         obj = _strip_rby1_article(pick_match.group("object"))
         if obj:
@@ -2609,14 +2780,6 @@ def main(argv: list[str] | None = None) -> None:
                         console.print(f"[red]Error:[/] {exc}")
                 continue
 
-            # ---- MolmoSpaces RBY1 structured skill text ----
-            if _handle_rby1_agent_text(user_input, registry, session, app_state):
-                continue
-
-            # ---- MolmoSpaces RBY1 direct text ----
-            if _handle_rby1_direct_text(user_input, registry, session, app_state):
-                continue
-
             # ---- Engine turn ----
             if engine is None:
                 console.print(f"[yellow]No API key. Use /login to authenticate first.[/]")
@@ -2637,14 +2800,8 @@ def main(argv: list[str] | None = None) -> None:
             # (route through the nav-stack instead of the open-loop walk) and LATENCY
             # are tracked native improvements (see docs/ARCHITECTURE.md), NOT reasons to
             # fall back to legacy.
-            if (
-                not app_state.get("molmospaces_rby1_vgg")
-                and _repl_native_enabled()
-                and _intent_actionable(engine, user_input)
-            ):
-                if _repl_attempt_native(engine, user_input, session, app_state, console):
-                    continue
-                # native took NO action -> fall through to legacy routing (unchanged).
+            # Native/VGG producers are intentionally not attempted here. All
+            # ordinary text is owned by the DeepSeek agent loop below.
 
             try:
                 # Single in-place progress region for the whole turn. A reasoning
@@ -2841,15 +2998,13 @@ def main(argv: list[str] | None = None) -> None:
                 #     answer-only trace (chat is verified too; the moat is intact).
                 # VECTOR_LEGACY_TURN=1 restores the exact pre-cutover fork
                 # (vgg_decompose-then-run_turn) for one release as a fallback.
-                _legacy_turn = os.environ.get("VECTOR_LEGACY_TURN") == "1"
-                if _legacy_turn:
-                    goal_tree = engine.vgg_decompose(user_input)
-                else:
-                    goal_tree = (
-                        engine.vgg_decompose(user_input)
-                        if engine.classify_intent(user_input).use_vgg
-                        else None
-                    )
+                # Ordinary terminal text always enters the agent-layer ReAct
+                # loop. VGG is no longer a competing producer for CLI turns;
+                # DeepSeek chooses and invokes the registered OneRING/A* skills.
+                # Explicit slash commands and ``!`` shell commands were handled
+                # above and remain intentionally outside this path.
+                _legacy_turn = True
+                goal_tree = None
                 if goal_tree is not None:
                     # Show plan BEFORE execution
                     console.print()

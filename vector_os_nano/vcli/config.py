@@ -26,6 +26,10 @@ _DEFAULTS: dict[str, Any] = {
     "anthropic_api_key": "",
     "openrouter_api_key": "",
     "base_url": "",
+    "openai_api_key": "",
+    "openai_base_url": "https://api.openai.com/v1",
+    "openai_model": "gpt-5.6-terra",
+    "openai_wire_api": "chat",
 }
 
 
@@ -134,6 +138,19 @@ def resolve_credentials(
     api_key = cli_api_key or ""
     provider = "anthropic"
     base_url = cli_base_url
+
+    # Explicit OpenAI-compatible provider.  This is used by Qwen gateways that
+    # expose an OpenAI API while authenticating with OPENAI_API_KEY.
+    forced_provider = os.environ.get("VECTOR_PROVIDER", "").strip().lower()
+    if forced_provider in {"openai", "openai_compat", "openai_responses", "responses", "codex"}:
+        api_key = api_key or os.environ.get("OPENAI_API_KEY", "") or str(config.get("openai_api_key", ""))
+        base_url = base_url or os.environ.get("OPENAI_BASE_URL") or str(config.get("openai_base_url", "")) or "https://api.openai.com/v1"
+        model = cli_model or os.environ.get("VECTOR_MODEL") or os.environ.get("OPENAI_MODEL") or str(config.get("openai_model", "gpt-5.6-terra"))
+        wire_api = (os.environ.get("VECTOR_OPENAI_WIRE_API")
+                    or os.environ.get("OPENAI_WIRE_API")
+                    or str(config.get("openai_wire_api", "chat"))).strip().lower()
+        provider = "openai_responses" if wire_api in {"responses", "response"} else "openai_compat"
+        return api_key, provider, model, base_url
 
     # DeepSeek branch: OpenAI-compatible provider (model ids carry no slash and must
     # NOT be mangled by the OpenRouter "anthropic/" prefix below).  Activated when:

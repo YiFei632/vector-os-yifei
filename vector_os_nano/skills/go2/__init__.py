@@ -14,6 +14,7 @@ from vector_os_nano.skills.go2.stop import StopSkill
 from vector_os_nano.skills.go2.look import LookSkill, DescribeSceneSkill
 from vector_os_nano.skills.go2.patrol import PatrolSkill
 from vector_os_nano.skills.navigate import NavigateSkill
+from vector_os_nano.skills.navigation_vln import OneRINGNavigationSkill
 
 
 def get_go2_skills() -> list:
@@ -28,6 +29,10 @@ def get_go2_skills() -> list:
         LookSkill(),
         DescribeSceneSkill(),
         PatrolSkill(),
+        # Registered last so natural-language navigation aliases select the
+        # generic RGB-D VLN skill; callers can still invoke ``navigate`` by name
+        # for a known SceneGraph room.
+        OneRINGNavigationSkill(),
     ]
 
 
@@ -44,5 +49,6 @@ __all__ = [
     "LookSkill",
     "DescribeSceneSkill",
     "PatrolSkill",
+    "OneRINGNavigationSkill",
     "get_go2_skills",
 ]

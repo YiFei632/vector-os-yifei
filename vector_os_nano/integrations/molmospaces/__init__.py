@@ -7,6 +7,7 @@ from __future__ import annotations
 from .bridge import MolmoSpacesRBY1Bridge
 from .client import MolmoSpacesRBY1Client, MolmoSpacesRBY1Error
 from .perception import MolmoSpacesRBY1Perception, sync_scene_to_context
+from .base import MolmoSpacesRBY1Base, ROS2RBY1Base
 
 __all__ = [
     "MolmoSpacesRBY1Bridge",
@@ -14,4 +15,6 @@ __all__ = [
     "MolmoSpacesRBY1Error",
     "MolmoSpacesRBY1Perception",
     "sync_scene_to_context",
+    "MolmoSpacesRBY1Base",
+    "ROS2RBY1Base",
 ]

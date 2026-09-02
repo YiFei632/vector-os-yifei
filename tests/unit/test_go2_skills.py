@@ -137,10 +137,10 @@ class TestSkillRegistration:
     def test_get_go2_skills(self):
         from vector_os_nano.skills.go2 import get_go2_skills
         skills = get_go2_skills()
-        assert len(skills) == 12
+        assert len(skills) == 13
         names = {s.name for s in skills}
         assert names == {
             "walk", "turn", "stand", "sit", "lie_down",
             "navigate", "explore", "where_am_i", "stop",
-            "look", "describe_scene", "patrol",
+            "look", "describe_scene", "patrol", "onering_navigation",
         }

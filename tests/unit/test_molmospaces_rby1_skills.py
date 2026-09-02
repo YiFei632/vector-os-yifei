@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from vector_os_nano.core.skill import SkillContext
 from vector_os_nano.skills import molmospaces_rby1
-from vector_os_nano.skills.molmospaces_rby1 import RBY1NavigateToObjectSkill, RBY1PickObjectSkill
+from vector_os_nano.skills.molmospaces_rby1 import RBY1PickObjectSkill
 
 
 class _NoPickBridge:
@@ -36,27 +36,47 @@ def test_rby1_pick_fails_fast_when_bridge_does_not_advertise_manipulation(monkey
     assert bridge.execute_called is False
 
 
-class _NavBridge:
-    def __init__(self) -> None:
-        self.execute_kwargs = None
+def test_scene_sync_skill_syncs_bridge_objects_into_context(monkeypatch) -> None:
+    from vector_os_nano.skills.molmospaces_rby1 import RBY1SyncSceneSkill
 
-    def execute(self, *args, **kwargs):
-        self.execute_kwargs = kwargs
-        return {"success": True, "terminal_reason": "task_done"}
+    class Bridge:
+        def execute(self, instruction, *, context, mode, timeout_s):
+            assert context["structured_action"] == "list_scene_objects"
+            return {"objects": [{"object_id": "fridge_1", "category": "refrigerator", "position": [1, 2, 0]}]}
 
+    class Graph:
+        def __init__(self): self.objects = []
+        def add_object(self, obj): self.objects.append(obj)
 
-def test_rby1_navigation_does_not_request_execute_reset(monkeypatch) -> None:
-    bridge = _NavBridge()
-
-    def fake_bridge_for_context(context):
-        return bridge, {"endpoint": {"timeout_s": 1.0}, "context": {}}
-
-    monkeypatch.setattr(molmospaces_rby1, "_bridge_for_context", fake_bridge_for_context)
-
-    result = RBY1NavigateToObjectSkill().execute({"target": "table"}, SkillContext())
+    graph = Graph()
+    monkeypatch.setattr(
+        molmospaces_rby1,
+        "_bridge_for_context",
+        lambda _context: (Bridge(), {"endpoint": {"timeout_s": 1.0}, "context": {}}),
+    )
+    result = RBY1SyncSceneSkill().execute(
+        {}, SkillContext(services={"spatial_memory": graph})
+    )
 
     assert result.success is True
-    assert bridge.execute_kwargs is not None
-    assert bridge.execute_kwargs["context"]["structured_action"] == "navigate_to_object"
-    assert bridge.execute_kwargs["context"]["target_types"] == ["table"]
-    assert bridge.execute_kwargs["context"]["allow_execute_reset"] is False
+    assert result.result_data["synced_objects"] == 1
+    assert graph.objects[0].category == "refrigerator"
+
+
+def test_observe_skill_does_not_list_or_sync_scene_objects(monkeypatch) -> None:
+    from vector_os_nano.skills.molmospaces_rby1 import RBY1ObserveSkill
+
+    class Bridge:
+        def observe(self): return {"loaded": True, "robot": "rby1"}
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("observe must not query list_scene_objects")
+
+    monkeypatch.setattr(
+        molmospaces_rby1, "_bridge_for_context",
+        lambda _context: (Bridge(), {"endpoint": {"timeout_s": 1.0}}),
+    )
+
+    result = RBY1ObserveSkill().execute({}, SkillContext())
+
+    assert result.success is True
+    assert "objects" not in result.result_data
